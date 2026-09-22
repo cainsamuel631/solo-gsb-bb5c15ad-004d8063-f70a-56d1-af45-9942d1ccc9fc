@@ -47,6 +47,15 @@ Sides on which the location is absent stay ``null``. Redaction only
 rewrites the returned conflicts -- the merged document, conflict detection
 and resolutions always use the original values.
 
+:meth:`Merger.merge_with_provenance` additionally returns provenance
+records: one per actual changed leaf (or per identity-array item), located
+by its final JSON Pointer and tagged with the side the final value came
+from (``base`` / ``left`` / ``right`` / ``merged``), whether a conflict
+adjudication produced it, and whether the leaf/item was deleted. Deleted
+items keep their original base pointer. Provenance is derived from the
+same final artifacts as the merged document and conflicts, so it stays
+consistent with protected paths, redaction and resolutions.
+
 The merge result is deterministic for identical inputs.
 """
 
@@ -86,6 +95,27 @@ class RawConflict(NamedTuple):
     base: Any
     left: Any
     right: Any
+
+
+class RawProvenance(NamedTuple):
+    """One provenance record (internal path until pointers are rendered)."""
+
+    path: tuple
+    source: str  # "base" | "left" | "right" | "merged"
+    adjudicated: bool
+    deleted: bool
+
+
+class _MergeResult(NamedTuple):
+    """Artifacts of a full merge run, shared by the conflict and the
+    provenance paths so both describe exactly the same final outcome."""
+
+    merged: Any
+    conflicts: list  # final, rendered, redacted RawConflicts
+    plain: Any  # pass 1: unprotected merge without resolutions
+    raw_conflicts: list  # pass 2: internal-path conflicts, original values
+    protected: frozenset
+    logical_resolutions: dict
 
 
 class Merger:
@@ -174,12 +204,76 @@ class Merger:
         returned conflicts only; *merged* and conflict detection always
         use the original values.
         """
+        result = self._run_merge(base, left, right, resolutions)
+        return result.merged, result.conflicts
+
+    def merge_with_provenance(
+        self,
+        base: Any,
+        left: Any,
+        right: Any,
+        resolutions: Optional[dict[str, str]] = None,
+    ) -> tuple[Any, list[RawConflict], list[RawProvenance]]:
+        """Like :meth:`merge`, additionally returning provenance records.
+
+        Each record describes one actual change leaf (or one identity-array
+        item) of the final document: its final JSON Pointer, the side the
+        final value came from (``"base"``, ``"left"``, ``"right"`` or
+        ``"merged"``), whether a conflict adjudication produced it, and
+        whether the leaf/item was deleted (deleted items keep their
+        original base pointer).
+        """
+        result = self._run_merge(base, left, right, resolutions)
+        records = _ProvenanceCollector(self, result).collect(
+            base, left, right
+        )
+        rendered = [
+            RawProvenance(
+                path=self._render_provenance_path(
+                    result, base, record
+                ),
+                source=record.source,
+                adjudicated=record.adjudicated,
+                deleted=record.deleted,
+            )
+            for record in records
+        ]
+        # Stable order: by final JSON Pointer, the same text used in the
+        # response conflicts.
+        rendered.sort(key=lambda r: r.path)
+        return result.merged, result.conflicts, rendered
+
+    @staticmethod
+    def _render_provenance_path(
+        result: _MergeResult, base: Any, record: RawProvenance
+    ) -> str:
+        """Render a provenance path to its final JSON Pointer.
+
+        Existing/new items are located in the final merged document, so a
+        non-deleted item carries its resolved final index. A deleted item
+        keeps its original base pointer: it is rendered against the
+        unprotected merge (where withheld siblings still exist) and then
+        base, exactly like reported deletion conflicts.
+        """
+        if record.deleted:
+            return _render_path(result.merged, result.plain, base, record.path)
+        return _render_path(result.merged, result.plain, base, record.path,
+                            deleted=False)
+
+    def _run_merge(
+        self,
+        base: Any,
+        left: Any,
+        right: Any,
+        resolutions: Optional[dict[str, str]] = None,
+    ) -> _MergeResult:
+        """Perform every merge pass and bundle the final artifacts."""
         # Pass 1: plain merge. Its output locates where every change ends
         # up, and a parallel walk enumerates every changed logical path so
         # we can tell which configured protectedPaths actually hit a
         # left/right change (shortcuts like one-sided edits would otherwise
         # skip subtree traversal).
-        merged, raw = self._merge_pass(base, left, right, resolutions=None)
+        plain, _ = self._merge_pass(base, left, right, resolutions=None)
         changed = self._enumerate_changes(base, left, right, ())
 
         protected: set[tuple] = set()
@@ -196,21 +290,23 @@ class Merger:
             # Fields of objects and of identity-array items match by their
             # final reported pointer: match the rendered pointer too so a
             # concrete index lines up with the configured pattern.
-            pointer = _render_path(merged, base, base, path)
+            pointer = _render_path(plain, base, base, path)
             if self._is_protected(parse_pointer(pointer)):
                 protected.add(path)
+        protected_frozen = frozenset(protected)
 
         # Pass 2: canonical merge with protection applied and no
         # resolutions. Its outcome and conflicts are resolution
         # independent: conflicts always report the original three-way
         # values.
         merged_kept, raw = self._merge_pass(
-            base, left, right, resolutions=None, protected=frozenset(protected),
+            base, left, right, resolutions=None, protected=protected_frozen,
         )
         resolved = self._resolve_paths(
-            merged_kept, merged, base, [c.path for c in raw]
+            merged_kept, plain, base, [c.path for c in raw]
         )
 
+        logical_resolutions: dict[tuple, str] = {}
         if resolutions:
             # Pass 3: re-merge with both protection and resolutions,
             # substituting the chosen side's value at each resolved
@@ -220,7 +316,6 @@ class Merger:
             by_tokens: dict[tuple[str, ...], tuple] = {}
             for conflict, pointer in zip(raw, resolved):
                 by_tokens[parse_pointer(pointer)] = conflict.path
-            logical: dict[tuple, str] = {}
             for pointer, side in resolutions.items():
                 if side not in self.RESOLUTION_SIDES:
                     raise ValueError(
@@ -233,10 +328,10 @@ class Merger:
                     raise ValueError(
                         _unknown_resolution_message(pointer, tokens, merged_kept)
                     )
-                logical[conflict_path] = side
+                logical_resolutions[conflict_path] = side
             merged, _ = self._merge_pass(
                 base, left, right,
-                resolutions=logical, protected=frozenset(protected),
+                resolutions=logical_resolutions, protected=protected_frozen,
             )
         else:
             merged = merged_kept
@@ -262,7 +357,14 @@ class Merger:
                     right=_public(right_value),
                 )
             )
-        return merged, final_conflicts
+        return _MergeResult(
+            merged=merged,
+            conflicts=final_conflicts,
+            plain=plain,
+            raw_conflicts=raw,
+            protected=protected_frozen,
+            logical_resolutions=logical_resolutions,
+        )
 
     def _merge_pass(
         self,
@@ -1052,7 +1154,531 @@ class Merger:
 _UNGUARDED: Any = object()
 
 
-def _render_path(kept: Any, plain: Any, base: Any, path: tuple) -> str:
+class _ProvenanceCollector:
+    """Derive provenance records for one finished merge run.
+
+    The walk mirrors the engine's structural routing -- objects descend
+    field by field, identity-configured arrays itemize per identity, plain
+    arrays and scalars are atomic leaves -- so the recorded units are
+    exactly the units the engine merged. Outcomes are read from the final
+    document; *why* a location has that outcome (a conflict adjudication,
+    a protected-path freeze, an automatic merge) is read from the run's
+    conflict/protection/resolution artifacts, keeping provenance consistent
+    with ``protectedPaths``, ``redactPaths`` (which never touches the
+    merged document) and ``conflictResolutions``.
+    """
+
+    def __init__(self, merger: "Merger", result: _MergeResult) -> None:
+        self.m = merger
+        self.final = result.merged
+        self.plain = result.plain
+        self.protected = result.protected
+        self.resolutions = result.logical_resolutions
+        self.conflict_paths = {conflict.path for conflict in result.raw_conflicts}
+
+    def collect(self, base: Any, left: Any, right: Any) -> list[RawProvenance]:
+        return self._node(self.final, base, left, right, (), gov=None)
+
+    # ------------------------------------------------------------ routing
+
+    def _node(
+        self,
+        final: Any,
+        b: Any,
+        l: Any,
+        r: Any,
+        path: tuple,
+        gov: Optional[tuple[str, bool]],
+    ) -> list[RawProvenance]:
+        # Unchanged on both sides: not an actual change leaf, even beneath
+        # an adjudicated wholesale unit.
+        if gov is None and json_equal(l, b) and json_equal(r, b):
+            return []
+        # A location absent from both base and the final document (a
+        # withheld addition, or a both-added conflict adjudicated to
+        # "base") has no final pointer and is not a deletion either: the
+        # attempted change is still visible in the reported conflicts.
+        if b is MISSING and final is MISSING:
+            return []
+        # Identity arrays route before anything else whenever the engine
+        # itemized them; objects descend field by field; the rest is one
+        # atomic leaf.
+        id_key = self._itemizes(b, l, r, path)
+        if id_key is not None:
+            return self._identity_array(final, b, l, r, path, id_key, gov)
+        if self._object_route(b, l, r, path):
+            # An added, deleted or replaced empty object has no leaf
+            # children but is itself an actual changed leaf; a withheld
+            # empty addition (absent from base and the final document)
+            # records nothing.
+            present_sides = [
+                v for v in (b, l, r) if v is not MISSING
+            ]
+            if present_sides and all(_is_empty_object(v) for v in present_sides):
+                if not (b is MISSING and final is MISSING):
+                    return [self._leaf_record(final, b, l, r, path, gov)]
+            unit_gov = gov if gov is not None else self._one_sided_object_gov(
+                b, l, r, path
+            )
+            return self._object(final, b, l, r, path, unit_gov)
+        return [self._leaf_record(final, b, l, r, path, gov)]
+
+    def _itemizes(
+        self, b: Any, l: Any, r: Any, path: tuple
+    ) -> Optional[str]:
+        """Identity field when the engine itemizes this node, else None."""
+        id_key = self.m._identity_key(path)
+        if id_key is None:
+            return None
+        if (
+            isinstance(b, list)
+            and isinstance(l, list)
+            and isinstance(r, list)
+            and _identity_eligible(b, l, r, id_key)
+        ):
+            return id_key
+        # One-sided array add/delete (or a one-sided addition at an
+        # identity-configured path absent from base): itemized only when
+        # protection can reach inside, exactly as in _merge_value.
+        b_list = b if isinstance(b, list) else ([] if b is MISSING else None)
+        l_list = l if isinstance(l, list) else ([] if l is MISSING else None)
+        r_list = r if isinstance(r, list) else ([] if r is MISSING else None)
+        if (
+            b_list is not None
+            and l_list is not None
+            and r_list is not None
+            and (l is not MISSING or r is not MISSING)
+            and (
+                (b is not MISSING and self.m._protected_below(self.protected, path))
+                or (
+                    b is MISSING
+                    and (l is MISSING or r is MISSING)
+                    and self.m._protected_pattern_under(path)
+                )
+            )
+            and _identity_eligible(b_list, l_list, r_list, id_key)
+        ):
+            return id_key
+        return None
+
+    def _object_route(self, b: Any, l: Any, r: Any, path: tuple) -> bool:
+        if isinstance(b, dict) and isinstance(l, dict) and isinstance(r, dict):
+            return True
+        # Object added on both sides where base carried none: field-wise
+        # only when a (hit) protected path lives below.
+        if (
+            b is MISSING
+            and isinstance(l, dict)
+            and isinstance(r, dict)
+            and self.m._protected_below(self.protected, path)
+        ):
+            return True
+        return (l is MISSING or r is MISSING) and _revisions_as_dicts(b, l, r)
+
+    def _one_sided_object_gov(
+        self, b: Any, l: Any, r: Any, path: tuple
+    ) -> Optional[tuple[str, bool]]:
+        """Wholesale outcome of a one-sided object add/delete unit.
+
+        Returns ``(source, adjudicated)`` when the whole unit is frozen or
+        adjudicated, or None for the ordinary shortcuts (plain one-sided
+        add, accepted deletion), whose leaves derive their source by
+        comparison.
+        """
+        if not ((l is MISSING or r is MISSING) and _revisions_as_dicts(b, l, r)):
+            return None
+        hits = sorted(
+            (p for p in self.protected if p == path or p[: len(path)] == path),
+            key=_path_sort_key,
+        )
+        if hits:
+            for hit_path in hits:
+                side = self.resolutions.get(hit_path)
+                if side is not None:
+                    return side, True
+            return "base", False
+        if b is MISSING:
+            return None  # plain one-sided addition
+        survivor = l if l is not MISSING else r
+        if json_equal(survivor, b):
+            return None  # deletion accepted while the other side stayed put
+        # Unit-level delete_vs_modify conflict: adjudicated or kept base.
+        side = self.resolutions.get(path)
+        return (side, True) if side is not None else ("base", False)
+
+    # -------------------------------------------------------------- units
+
+    def _object(
+        self,
+        final: Any,
+        b: Any,
+        l: Any,
+        r: Any,
+        path: tuple,
+        gov: Optional[tuple[str, bool]],
+    ) -> list[RawProvenance]:
+        b_obj = b if isinstance(b, dict) else {}
+        l_obj = l if isinstance(l, dict) else {}
+        r_obj = r if isinstance(r, dict) else {}
+        f_obj = final if isinstance(final, dict) else {}
+        records: list[RawProvenance] = []
+        for key in sorted(set(b_obj) | set(l_obj) | set(r_obj)):
+            records += self._node(
+                f_obj.get(key, MISSING),
+                b_obj.get(key, MISSING),
+                l_obj.get(key, MISSING),
+                r_obj.get(key, MISSING),
+                path + (key,),
+                gov,
+            )
+        return records
+
+    def _identity_array(
+        self,
+        final: Any,
+        b: Any,
+        l: Any,
+        r: Any,
+        path: tuple,
+        id_key: str,
+        gov: Optional[tuple[str, bool]],
+    ) -> list[RawProvenance]:
+        b_map = _index_items(b if isinstance(b, list) else [], id_key)
+        l_map = _index_items(l if isinstance(l, list) else [], id_key)
+        r_map = _index_items(r if isinstance(r, list) else [], id_key)
+        f_map = _index_items(final if isinstance(final, list) else [], id_key)
+
+        records: list[RawProvenance] = []
+        # Existing items keep base order; new identities follow, sorted --
+        # the same emission order the engine uses to build the array.
+        for canon_id, b_item in b_map.items():
+            l_item = l_map.get(canon_id, MISSING)
+            r_item = r_map.get(canon_id, MISSING)
+            item_path = path + (IdMarker(id_key, b_item[id_key]),)
+            records += self._existing_item(
+                f_map.get(canon_id, MISSING),
+                b_item, l_item, r_item, item_path, gov,
+            )
+        new_ids = (set(l_map) | set(r_map)) - set(b_map)
+        new_items: list[tuple[Any, Any, Any, Any, Any]] = []
+        for canon_id in new_ids:
+            l_item = l_map.get(canon_id, MISSING)
+            r_item = r_map.get(canon_id, MISSING)
+            present = l_item if l_item is not MISSING else r_item
+            new_items.append((present[id_key], canon_id, present, l_item, r_item))
+        new_items.sort(key=lambda t: _sort_key(t[0]))
+        for _id_value, canon_id, present, l_item, r_item in new_items:
+            item_path = path + (IdMarker(id_key, present[id_key]),)
+            records += self._new_item(
+                f_map.get(canon_id, MISSING),
+                l_item, r_item, item_path, path, gov,
+            )
+        return records
+
+    def _existing_item(
+        self,
+        f_item: Any,
+        b_item: Any,
+        l_item: Any,
+        r_item: Any,
+        item_path: tuple,
+        gov: Optional[tuple[str, bool]],
+    ) -> list[RawProvenance]:
+        if json_equal(l_item, b_item) and json_equal(r_item, b_item):
+            return []
+        if gov is not None:
+            return [self._item_record(item_path, f_item, b_item, gov)]
+
+        if l_item is MISSING and r_item is MISSING:
+            if item_path in self.protected:
+                # Deleting a protected item on both sides freezes it; this
+                # engine branch does not consult resolutions.
+                return [RawProvenance(item_path, "base", False, False)]
+            return [RawProvenance(item_path, "merged", False, True)]
+
+        if l_item is MISSING or r_item is MISSING:
+            hits = self._item_hits(item_path, descendants_atomic=True)
+            hits = self._changed_guarded_hits(
+                b_item, l_item, r_item, item_path, hits
+            )
+            if hits:
+                side = self._first_resolved(hits)
+                if side is not None:
+                    return [self._item_record(item_path, f_item, b_item, (side, True))]
+                return [RawProvenance(item_path, "base", False, False)]
+            survivor = r_item if l_item is MISSING else l_item
+            if json_equal(survivor, b_item):
+                # Other side untouched: the deleting side's deletion is
+                # accepted.
+                side = "left" if l_item is MISSING else "right"
+                return [RawProvenance(item_path, side, False, True)]
+            side = self.resolutions.get(item_path)
+            if side is not None:
+                return [self._item_record(item_path, f_item, b_item, (side, True))]
+            return [RawProvenance(item_path, "base", False, False)]
+
+        # Present on both sides.
+        if item_path in self.protected:
+            side = self.resolutions.get(item_path)
+            if side is not None:
+                return [self._item_record(item_path, f_item, b_item, (side, True))]
+            return [RawProvenance(item_path, "base", False, False)]
+        # Field-wise merge: the one item record is adjudicated when the
+        # item itself or a conflicting field of THIS item was adjudicated.
+        # Identity steps must compare as identities, not by rendered index.
+        adjudicated = self._has_resolution_at_or_below(item_path)
+        changed = (
+            not json_equal(f_item, b_item)
+            or adjudicated
+            or any(
+                self._is_descendant_path(conflict_path, item_path)
+                for conflict_path in self.conflict_paths
+            )
+        )
+        if not changed:
+            return []
+        return [
+            RawProvenance(
+                item_path,
+                _compare_source(f_item, b_item, l_item, r_item),
+                adjudicated,
+                False,
+            )
+        ]
+
+    def _new_item(
+        self,
+        f_item: Any,
+        l_item: Any,
+        r_item: Any,
+        item_path: tuple,
+        array_path: tuple,
+        gov: Optional[tuple[str, bool]],
+    ) -> list[RawProvenance]:
+        # A new item absent from the final document (a protected freeze or
+        # an adjudication to "base"/the adding side) exists neither in base
+        # nor at any final pointer: nothing to record, the attempted change
+        # is still reported as a conflict.
+        if f_item is MISSING:
+            return []
+
+        if gov is not None:
+            return [self._item_record(item_path, f_item, MISSING, gov)]
+
+        one_sided = l_item is MISSING or r_item is MISSING
+        if item_path in self.protected:
+            side = self.resolutions.get(item_path)
+            if side is not None:
+                return [self._item_record(item_path, f_item, MISSING, (side, True))]
+            return [RawProvenance(item_path, "base", False, False)]
+
+        hits = self._item_hits(item_path, descendants_atomic=one_sided)
+        hits = self._changed_guarded_hits(
+            MISSING, l_item, r_item, item_path, hits
+        )
+        if hits:
+            side = self._first_resolved(hits)
+            if side is not None:
+                return [self._item_record(item_path, f_item, MISSING, (side, True))]
+            if one_sided:
+                # One-sided addition carrying a hit protected descendant
+                # is withheld wholesale, unresolved.
+                return [RawProvenance(item_path, "base", False, False)]
+            # Both sides add the item: fields merge individually.
+            adjudicated = self._has_resolution_at_or_below(item_path)
+            if json_equal(f_item, l_item):
+                source = "left"
+            elif json_equal(f_item, r_item):
+                source = "right"
+            else:
+                # Field-wise assembly of both sides' additions.
+                source = "merged"
+            return [RawProvenance(item_path, source, adjudicated, False)]
+
+        if l_item is MISSING:
+            return [RawProvenance(item_path, "right", False, False)]
+        if r_item is MISSING:
+            return [RawProvenance(item_path, "left", False, False)]
+        if json_equal(l_item, r_item):
+            return [RawProvenance(item_path, "merged", False, False)]
+        # Same new identity, different content: both_added conflict on the
+        # parent array; left wins by default, base withholds the item.
+        side = self.resolutions.get(array_path)
+        if side is not None:
+            return [self._item_record(item_path, f_item, MISSING, (side, True))]
+        return [RawProvenance(item_path, "left", False, False)]
+
+    # -------------------------------------------------------------- leaves
+
+    def _item_record(
+        self,
+        item_path: tuple,
+        f_item: Any,
+        b_item: Any,
+        gov: tuple[str, bool],
+    ) -> RawProvenance:
+        """One item record under an explicit (adjudicated/frozen) outcome.
+
+        A wholesale item decision fixes the source to the governing side
+        (including a deletion or a withheld base-less addition).
+        """
+        side, adjudicated = gov
+        deleted = f_item is MISSING and b_item is not MISSING
+        return RawProvenance(item_path, side, adjudicated, deleted)
+
+    def _item_hits(
+        self, item_path: tuple, descendants_atomic: bool
+    ) -> list[tuple]:
+        hits = [
+            p
+            for p in self.protected
+            if p == item_path
+            or (descendants_atomic and p[: len(item_path)] == item_path)
+        ]
+        return sorted(hits, key=_path_sort_key)
+
+    def _first_resolved(self, hits: list[tuple]) -> Optional[str]:
+        for hit_path in hits:
+            side = self.resolutions.get(hit_path)
+            if side is not None:
+                return side
+        return None
+
+    def _changed_guarded_hits(
+        self,
+        b_item: Any,
+        l_item: Any,
+        r_item: Any,
+        item_path: tuple,
+        hits: list[tuple],
+    ) -> list[tuple]:
+        """Hits that actually changed on a side, mirroring the engine.
+
+        A configured protected descendant that stays equal to base on both
+        revisions (including a field present on a newly added item but
+        absent from base on the other, untouched side) does not guard the
+        unit -- only the engine's change scan marks such a path.
+        """
+        changed: list[tuple] = []
+        for hit_path in hits:
+            b, l, r = _descend_at(
+                b_item, l_item, r_item, hit_path[len(item_path):]
+            )
+            if not json_equal(l, b) or not json_equal(r, b):
+                changed.append(hit_path)
+        return changed
+
+    @staticmethod
+    def _is_descendant_path(path: tuple, ancestor: tuple) -> bool:
+        """Whether internal *path* equals or descends from *ancestor*.
+
+        Unlike a plain tuple prefix, an identity-array step (IdMarker)
+        matches only the same identity, so a resolution on one item never
+        counts as a descendant of a different item.
+        """
+        if len(path) < len(ancestor):
+            return False
+        for step, anc in zip(path, ancestor):
+            if isinstance(anc, IdMarker) or isinstance(step, IdMarker):
+                if not (
+                    isinstance(anc, IdMarker)
+                    and isinstance(step, IdMarker)
+                    and anc.id_key == step.id_key
+                    and _canonical_id(anc.id_value) == _canonical_id(step.id_value)
+                ):
+                    return False
+            elif step != anc:
+                return False
+        return True
+
+    def _has_resolution_at_or_below(self, item_path: tuple) -> bool:
+        """Whether the item itself or one of its fields was adjudicated."""
+        return any(
+            self._is_descendant_path(res_path, item_path)
+            for res_path in self.resolutions
+        )
+
+    def _leaf_record(
+        self,
+        final: Any,
+        b: Any,
+        l: Any,
+        r: Any,
+        path: tuple,
+        gov: Optional[tuple[str, bool]],
+    ) -> RawProvenance:
+        if gov is not None:
+            # The value of a wholesale unit is fixed by the governing
+            # outcome: it comes from the chosen side (including a
+            # deletion), or from base when an unresolved conflict froze it.
+            source, adjudicated = gov
+        else:
+            side = self.resolutions.get(path)
+            if side is not None:
+                source, adjudicated = side, True
+            else:
+                source = _compare_source(final, b, l, r)
+                adjudicated = False
+        deleted = final is MISSING and b is not MISSING
+        return RawProvenance(path, source, adjudicated, deleted)
+
+
+def _is_empty_object(value: Any) -> bool:
+    """Whether *value* is an empty JSON object (not the MISSING sentinel)."""
+    return isinstance(value, dict) and not value
+
+
+def _compare_source(final: Any, b: Any, l: Any, r: Any) -> str:
+    """Side the final leaf value came from, by three-way comparison.
+
+    ``"merged"`` is returned for an identical change on both sides (or a
+    field-wise adjudicated value matching neither whole side); a final
+    value equal to base is sourced ``"base"`` (an unresolved conflict or a
+    protection freeze); a missing final value over a present base is an
+    accepted deletion sourced from the deleting side; a missing final
+    value over a missing base is a withheld addition sourced from base.
+    """
+    if final is MISSING:
+        if b is not MISSING:
+            if l is MISSING and r is MISSING:
+                return "merged"
+            if l is MISSING:
+                return "left"
+            if r is MISSING:
+                return "right"
+        return "base"
+    if b is MISSING:
+        # Identical two-sided additions are sourced "merged"; check this
+        # before matching one side so an equal left/right pair is not
+        # attributed to "left".
+        if l is not MISSING and r is not MISSING and json_equal(l, r):
+            return "merged"
+        if l is not MISSING and json_equal(final, l):
+            return "left"
+        if r is not MISSING and json_equal(final, r):
+            return "right"
+        return "left" if l is not MISSING else "right"
+    if json_equal(final, b):
+        return "base"
+    # A value both sides changed identically (final == left == right !=
+    # base) is sourced "merged", not from whichever side is compared first.
+    if l is not MISSING and r is not MISSING and json_equal(l, r):
+        return "merged"
+    if l is not MISSING and json_equal(final, l):
+        return "left"
+    if r is not MISSING and json_equal(final, r):
+        return "right"
+    return "merged"
+
+
+
+def _render_path(
+    kept: Any,
+    plain: Any,
+    base: Any,
+    path: tuple,
+    deleted: Optional[bool] = None,
+) -> str:
     """Render an internal path against the merge documents.
 
     Marker steps are located by identity, in order, in *kept* (the
@@ -1061,8 +1687,18 @@ def _render_path(kept: Any, plain: Any, base: Any, path: tuple) -> str:
     *base* (for deleted base items: deletions report their original path).
     The documents are traversed with independent cursors; once a document
     fails to resolve a step, later steps stay on the next fallback.
+
+    *deleted* forces the interpretation: ``False`` renders a live location
+    strictly against *kept* (its true final index); ``True`` renders a
+    deleted base item preferring *plain* then *base* (its original index).
+    With ``None`` the fallback chain above is used for conflict pointers.
     """
-    cursors: list[Any] = [kept, plain, base]
+    if deleted is False:
+        cursors: list[Any] = [kept, kept, kept]
+    elif deleted is True:
+        cursors = [plain, base, base]
+    else:
+        cursors = [kept, plain, base]
     steps: list[str] = []
     for step in path:
         if isinstance(step, (IdMarker, int)):

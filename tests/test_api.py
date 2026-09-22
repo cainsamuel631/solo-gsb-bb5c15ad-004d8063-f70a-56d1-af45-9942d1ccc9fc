@@ -754,6 +754,406 @@ def test_redact_paths_appear_in_openapi_schema():
     assert "[REDACTED]" in properties["redactPaths"]["description"]
 
 
+# ----------------------------------------------------------- includeProvenance
+
+
+def test_provenance_absent_from_response_by_default():
+    response = client.post(
+        "/merge",
+        json={"base": {"a": 1}, "left": {"a": 2}, "right": {"a": 1}},
+    )
+    assert response.status_code == 200
+    # The legacy envelope is unchanged: no provenance key at all.
+    assert set(response.json().keys()) == {"merged", "conflicts"}
+
+
+def test_provenance_absent_when_explicitly_false():
+    response = client.post(
+        "/merge",
+        json={
+            "base": {"a": 1}, "left": {"a": 2}, "right": {"a": 1},
+            "includeProvenance": False,
+        },
+    )
+    assert response.status_code == 200
+    assert set(response.json().keys()) == {"merged", "conflicts"}
+
+
+def test_provenance_accepts_snake_case_alias():
+    response = client.post(
+        "/merge",
+        json={
+            "base": {"a": 1}, "left": {"a": 2}, "right": {"a": 1},
+            "include_provenance": True,
+        },
+    )
+    assert response.status_code == 200
+    assert "provenance" in response.json()
+
+
+def test_provenance_empty_when_nothing_changed():
+    response = client.post(
+        "/merge",
+        json={
+            "base": {"a": 1}, "left": {"a": 1}, "right": {"a": 1},
+            "includeProvenance": True,
+        },
+    )
+    assert response.status_code == 200
+    assert response.json()["provenance"] == []
+
+
+def test_provenance_records_basic_leaf_sources():
+    payload = {
+        "base": {"a": 1, "b": 2, "same": 9, "keep": 0},
+        "left": {"a": 10, "b": 2, "same": 99, "keep": 0},
+        "right": {"a": 1, "b": 20, "same": 99, "keep": 0},
+        "includeProvenance": True,
+    }
+    body = client.post("/merge", json=payload).json()
+    assert body["provenance"] == [
+        {"pointer": "/a", "source": "left",
+         "adjudicated": False, "deleted": False},
+        {"pointer": "/b", "source": "right",
+         "adjudicated": False, "deleted": False},
+        # Identical change on both sides is sourced "merged".
+        {"pointer": "/same", "source": "merged",
+         "adjudicated": False, "deleted": False},
+    ]
+    # Unchanged leaves (/keep) are not recorded; order is by pointer.
+    assert [e["pointer"] for e in body["provenance"]] == sorted(
+        e["pointer"] for e in body["provenance"]
+    )
+
+
+def test_provenance_records_addition_and_deletion():
+    payload = {
+        "base": {"a": 1, "gone": 5},
+        "left": {"a": 1, "gone": 5, "added_left": 7},
+        "right": {"a": 1},  # deletes gone
+        "includeProvenance": True,
+    }
+    body = client.post("/merge", json=payload).json()
+    assert {(e["pointer"], e["source"], e["deleted"]) for e in body["provenance"]} == {
+        ("/added_left", "left", False),
+        ("/gone", "right", True),
+    }
+    deleted = next(e for e in body["provenance"] if e["deleted"])
+    assert deleted == {
+        "pointer": "/gone", "source": "right",
+        "adjudicated": False, "deleted": True,
+    }
+
+
+def test_provenance_deletion_on_both_sides_is_merged():
+    payload = {
+        "base": {"a": 1}, "left": {}, "right": {},
+        "includeProvenance": True,
+    }
+    body = client.post("/merge", json=payload).json()
+    assert body["provenance"] == [
+        {"pointer": "/a", "source": "merged",
+         "adjudicated": False, "deleted": True}
+    ]
+
+
+def test_provenance_unresolved_conflict_keeps_base():
+    payload = {
+        "base": {"a": 1}, "left": {"a": 2}, "right": {"a": 3},
+        "includeProvenance": True,
+    }
+    body = client.post("/merge", json=payload).json()
+    assert body["merged"] == {"a": 1}
+    assert body["provenance"] == [
+        {"pointer": "/a", "source": "base",
+         "adjudicated": False, "deleted": False}
+    ]
+
+
+def test_provenance_marks_conflict_adjudications():
+    payload = {
+        "base": {"a": 1, "b": 1},
+        "left": {"a": 2, "b": 2},
+        "right": {"a": 3, "b": 3},
+        "conflictResolutions": [{"pointer": "/a", "resolution": "right"}],
+        "includeProvenance": True,
+    }
+    body = client.post("/merge", json=payload).json()
+    assert body["merged"] == {"a": 3, "b": 1}
+    assert body["provenance"] == [
+        {"pointer": "/a", "source": "right",
+         "adjudicated": True, "deleted": False},
+        {"pointer": "/b", "source": "base",
+         "adjudicated": False, "deleted": False},
+    ]
+
+
+def test_provenance_adjudication_to_base_is_adjudicated():
+    payload = {
+        "base": {"a": 1}, "left": {"a": 2}, "right": {"a": 3},
+        "conflictResolutions": [{"pointer": "/a", "resolution": "base"}],
+        "includeProvenance": True,
+    }
+    body = client.post("/merge", json=payload).json()
+    assert body["provenance"] == [
+        {"pointer": "/a", "source": "base",
+         "adjudicated": True, "deleted": False}
+    ]
+
+
+def test_provenance_adjudicated_deletion_is_marked():
+    payload = {
+        "base": {"servers": [{"id": "a"}, {"id": "b"}]},
+        "left": {"servers": [{"id": "b"}]},  # deletes a
+        "right": {"servers": [{"id": "a", "x": 1}, {"id": "b"}]},  # edits a
+        "arrayIdentity": {"/servers": "id"},
+        "conflictResolutions": [{"pointer": "/servers/0", "resolution": "left"}],
+        "includeProvenance": True,
+    }
+    body = client.post("/merge", json=payload).json()
+    assert body["merged"] == {"servers": [{"id": "b"}]}
+    assert body["provenance"] == [
+        {"pointer": "/servers/0", "source": "left",
+         "adjudicated": True, "deleted": True}
+    ]
+
+
+def test_provenance_protected_path_keeps_base():
+    payload = {
+        "base": {"a": 1, "b": 2},
+        "left": {"a": 99, "b": 2},
+        "right": {"a": 1, "b": 20},
+        "protectedPaths": ["/a"],
+        "includeProvenance": True,
+    }
+    body = client.post("/merge", json=payload).json()
+    assert body["merged"] == {"a": 1, "b": 20}
+    assert body["provenance"] == [
+        {"pointer": "/a", "source": "base",
+         "adjudicated": False, "deleted": False},
+        {"pointer": "/b", "source": "right",
+         "adjudicated": False, "deleted": False},
+    ]
+
+
+def test_provenance_protected_path_adjudicated():
+    payload = {
+        "base": {"a": 1}, "left": {"a": 9}, "right": {"a": 1},
+        "protectedPaths": ["/a"],
+        "conflictResolutions": [{"pointer": "/a", "resolution": "left"}],
+        "includeProvenance": True,
+    }
+    body = client.post("/merge", json=payload).json()
+    assert body["merged"] == {"a": 9}
+    assert body["provenance"] == [
+        {"pointer": "/a", "source": "left",
+         "adjudicated": True, "deleted": False}
+    ]
+
+
+def test_provenance_withheld_protected_addition_records_nothing():
+    # A one-sided object add carrying a hit protected descendant is
+    # withheld wholesale: absent from both base and merged, so no final
+    # pointer exists and provenance records nothing for it.
+    payload = {
+        "base": {"k": 1},
+        "left": {"k": 1, "o": {"secret": "rotated", "host": "h"}},
+        "right": {"k": 1},
+        "protectedPaths": ["/o/secret"],
+        "includeProvenance": True,
+    }
+    body = client.post("/merge", json=payload).json()
+    assert body["merged"] == {"k": 1}
+    assert body["provenance"] == []
+
+
+def test_provenance_identity_array_uses_final_indices():
+    payload = {
+        "base": {"servers": [
+            {"id": "a", "v": 1},
+            {"id": "b", "v": 1},
+        ]},
+        # left deletes a, edits nothing else; right edits b.
+        "left": {"servers": [{"id": "b", "v": 1}]},
+        "right": {"servers": [
+            {"id": "a", "v": 1},
+            {"id": "b", "v": 8},
+            {"id": "c", "v": 3},
+        ]},
+        "arrayIdentity": {"/servers": "id"},
+        "includeProvenance": True,
+    }
+    body = client.post("/merge", json=payload).json()
+    # Deletion of a accepted (right touched a but left deleted it; right's
+    # edit is on b only): a is a delete_vs_modify? left deletes a, right
+    # leaves a untouched -> accepted deletion.
+    assert body["merged"] == {"servers": [
+        {"id": "b", "v": 8},
+        {"id": "c", "v": 3},
+    ]}
+    entries = {(e["pointer"], e["source"], e["deleted"])
+               for e in body["provenance"]}
+    # The deleted item keeps its ORIGINAL base pointer /servers/0 ...
+    assert ("/servers/0", "left", True) in entries
+    # ... while surviving item b, now at final index 0, uses the new index.
+    assert ("/servers/0", "right", False) in entries
+    # New item c appended at final index 1.
+    assert ("/servers/1", "right", False) in entries
+    # Sorted by the final pointer strings.
+    assert [e["pointer"] for e in body["provenance"]] == sorted(
+        e["pointer"] for e in body["provenance"]
+    )
+
+
+def test_provenance_identity_array_new_identical_item_is_merged():
+    payload = {
+        "base": {"servers": [{"id": "a"}]},
+        "left": {"servers": [{"id": "a"}, {"id": "z", "v": 1}]},
+        "right": {"servers": [{"id": "a"}, {"id": "z", "v": 1}]},
+        "arrayIdentity": {"/servers": "id"},
+        "includeProvenance": True,
+    }
+    body = client.post("/merge", json=payload).json()
+    assert body["provenance"] == [
+        {"pointer": "/servers/1", "source": "merged",
+         "adjudicated": False, "deleted": False}
+    ]
+
+
+def test_provenance_identity_array_field_assembly():
+    payload = {
+        "base": {"servers": [{"id": "a", "v": 1, "w": 1}]},
+        "left": {"servers": [{"id": "a", "v": 2, "w": 1}]},
+        "right": {"servers": [{"id": "a", "v": 1, "w": 9}]},
+        "arrayIdentity": {"/servers": "id"},
+        "includeProvenance": True,
+    }
+    body = client.post("/merge", json=payload).json()
+    assert body["merged"] == {"servers": [{"id": "a", "v": 2, "w": 9}]}
+    # One record per item (object array unit), assembled from both sides.
+    assert body["provenance"] == [
+        {"pointer": "/servers/0", "source": "merged",
+         "adjudicated": False, "deleted": False}
+    ]
+
+
+def test_provenance_plain_array_is_one_atomic_leaf():
+    payload = {
+        "base": {"a": [1, 2]}, "left": {"a": [1, 2, 3]},
+        "right": {"a": [1, 2]}, "includeProvenance": True,
+    }
+    body = client.post("/merge", json=payload).json()
+    assert body["provenance"] == [
+        {"pointer": "/a", "source": "left",
+         "adjudicated": False, "deleted": False}
+    ]
+
+
+def test_provenance_root_level_change():
+    payload = {
+        "base": 1, "left": 1, "right": 5,
+        "includeProvenance": True,
+    }
+    body = client.post("/merge", json=payload).json()
+    assert body["merged"] == 5
+    assert body["provenance"] == [
+        {"pointer": "", "source": "right",
+         "adjudicated": False, "deleted": False}
+    ]
+
+
+def test_provenance_added_empty_object_is_a_leaf():
+    payload = {
+        "base": {"k": 1},
+        "left": {"k": 1, "o": {}},
+        "right": {"k": 1},
+        "includeProvenance": True,
+    }
+    body = client.post("/merge", json=payload).json()
+    assert body["merged"] == {"k": 1, "o": {}}
+    assert body["provenance"] == [
+        {"pointer": "/o", "source": "left",
+         "adjudicated": False, "deleted": False}
+    ]
+
+
+def test_provenance_redaction_does_not_change_provenance():
+    payload = {
+        "base": {"a": 1, "pw": "x"},
+        "left": {"a": 2, "pw": "L"},
+        "right": {"a": 3, "pw": "R"},
+        "redactPaths": ["/pw"],
+        "conflictResolutions": [{"pointer": "/a", "resolution": "right"}],
+        "includeProvenance": True,
+    }
+    body = client.post("/merge", json=payload).json()
+    # Conflicts are masked...
+    pw_conflict = next(c for c in body["conflicts"] if c["pointer"] == "/pw")
+    assert pw_conflict["base"] == "[REDACTED]"
+    # ...but provenance reflects the true merged document (pw kept base).
+    assert body["merged"]["pw"] == "x"
+    assert {(e["pointer"], e["source"]) for e in body["provenance"]} == {
+        ("/a", "right"), ("/pw", "base"),
+    }
+
+
+def test_provenance_toggle_does_not_change_merged_or_conflicts():
+    payload = {
+        "base": {"a": 1}, "left": {"a": 2}, "right": {"a": 3},
+        "conflictResolutions": [{"pointer": "/a", "resolution": "right"}],
+    }
+    off = client.post("/merge", json=payload).json()
+    on = client.post("/merge", json={**payload, "includeProvenance": True}).json()
+    assert on["merged"] == off["merged"]
+    assert on["conflicts"] == off["conflicts"]
+
+
+def test_provenance_pointer_is_stable_and_sorted():
+    payload = {
+        "base": {"z": 1, "m": {"d": 1, "a": 1}, "a": [1]},
+        "left": {"z": 2, "m": {"d": 2, "a": 2}, "a": [1, 2]},
+        "right": {"z": 1, "m": {"d": 1, "a": 1}, "a": [1]},
+        "includeProvenance": True,
+    }
+    body = client.post("/merge", json=payload).json()
+    pointers = [e["pointer"] for e in body["provenance"]]
+    assert pointers == sorted(pointers)
+
+
+def test_include_provenance_must_be_boolean():
+    response = client.post(
+        "/merge",
+        json={
+            "base": 1, "left": 1, "right": 1,
+            "includeProvenance": ["please"],
+        },
+    )
+    assert response.status_code == 422
+
+
+def test_provenance_entry_shape_is_validated_in_schema():
+    schema = client.get("/openapi.json").json()
+    req_props = schema["components"]["schemas"]["MergeRequest"]["properties"]
+    assert "includeProvenance" in req_props
+    provenance_entry = schema["components"]["schemas"]["ProvenanceEntry"]
+    assert set(provenance_entry["required"]) == {
+        "pointer", "source", "adjudicated", "deleted"
+    }
+    assert set(provenance_entry["properties"]["source"]["enum"]) == {
+        "base", "left", "right", "merged"
+    }
+    response_schema = schema["components"]["schemas"]["MergeResponse"]
+    # provenance is optional (not required) and accepts an array or null.
+    assert "provenance" not in response_schema["required"]
+    response_props = response_schema["properties"]
+    assert "provenance" in response_props
+    any_of = response_props["provenance"]["anyOf"]
+    assert {"type": "null"} in any_of
+    assert any(spec.get("type") == "array" for spec in any_of)
+    # Only merged and conflicts are required at the envelope level.
+    assert response_schema["required"] == ["merged", "conflicts"]
+
+
 # ------------------------------------------------------------- size limiting
 
 

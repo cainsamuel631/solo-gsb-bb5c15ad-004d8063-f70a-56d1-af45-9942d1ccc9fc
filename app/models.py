@@ -12,6 +12,9 @@ JsonValue = Optional[Any]
 # Sides a conflict can be adjudicated to.
 ResolutionSide = Literal["base", "left", "right"]
 
+# Side a merged leaf ultimately came from.
+ProvenanceSource = Literal["base", "left", "right", "merged"]
+
 
 class ConflictResolution(BaseModel):
     """One adjudication: which side wins at a reported conflict."""
@@ -102,6 +105,22 @@ class MergeRequest(BaseModel):
             "HTTP 400."
         ),
     )
+    include_provenance: bool = Field(
+        default=False,
+        alias="includeProvenance",
+        description=(
+            "When true, the response includes a 'provenance' array "
+            "describing, for every actual changed leaf or identity-array "
+            "item in the final merged document, where its value came from "
+            "('base', 'left', 'right' or 'merged'), whether it resulted "
+            "from a conflict adjudication, and whether it was deleted. "
+            "Records are sorted by their final JSON Pointer (RFC 6901); "
+            "identity-array items use their final index and deleted items "
+            "keep their original base pointer. When false (the default) "
+            "the response shape is unchanged and no 'provenance' key is "
+            "emitted."
+        ),
+    )
 
 
 class Conflict(BaseModel):
@@ -122,6 +141,58 @@ class Conflict(BaseModel):
     right: JsonValue
 
 
+class ProvenanceEntry(BaseModel):
+    """Origin of one actual changed leaf or identity-array item."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    pointer: str = Field(
+        ...,
+        description=(
+            "JSON Pointer (RFC 6901) of the changed leaf or identity-array "
+            "item in the final merged document. Identity-array items use "
+            "their resolved final index. A deleted item keeps its original "
+            "base pointer and is additionally marked with 'deleted'."
+        ),
+    )
+    source: ProvenanceSource = Field(
+        ...,
+        description=(
+            "Where the final value came from: 'left' or 'right' for a "
+            "one-sided change or a conflict adjudicated to that side; "
+            "'base' for an unresolved conflict or a protectedPaths freeze "
+            "that kept the base value; 'merged' for an identical change on "
+            "both sides."
+        ),
+    )
+    adjudicated: bool = Field(
+        ...,
+        description=(
+            "True when the final value (or deletion) was produced by an "
+            "entry of conflictResolutions, including an adjudication that "
+            "overrides protectedPaths; false for automatic merges and "
+            "unresolved conflicts."
+        ),
+    )
+    deleted: bool = Field(
+        ...,
+        description=(
+            "True when the base carried a leaf/item at this pointer that "
+            "the final document does not contain. The pointer is the "
+            "deleted item's original base pointer."
+        ),
+    )
+
+
 class MergeResponse(BaseModel):
     merged: JsonValue
     conflicts: list[Conflict]
+    provenance: Optional[list[ProvenanceEntry]] = Field(
+        default=None,
+        description=(
+            "Present only when the request set includeProvenance=true. "
+            "One entry per actual changed leaf or identity-array item in "
+            "the final document, sorted by 'pointer'. Absent entirely from "
+            "the response when provenance was not requested."
+        ),
+    )

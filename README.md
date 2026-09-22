@@ -19,6 +19,19 @@ docker compose up --build -d
 
 停止：`docker compose down`；查看日志：`docker compose logs -f`。
 
+不使用 Compose 时，也可以直接用 Docker 启动（`-e` 可覆盖环境变量，
+`-p` 调整宿主机映射端口）：
+
+```bash
+docker build -t json-merge-api .
+docker run --rm -p 8000:8000 \
+  -e MAX_REQUEST_SIZE_BYTES=10M \
+  json-merge-api
+```
+
+镜像基于 `python:3.12-slim`，以非 root 用户运行，并内置指向 `/health` 的
+`HEALTHCHECK`；容器内固定监听 `8000` 端口。
+
 ## 配置（环境变量）
 
 | 变量 | 默认值 | 说明 |
@@ -149,6 +162,103 @@ reference token 比较，`/a~0b` 与等价写法视为重复）。数组元素�
 以下情况返回 **400**：指针格式非法、同一指针重复出现（按解码后的 reference token 比较）。
 数组元素不是字符串时返回 422。
 
+### 合并溯源（includeProvenance）
+
+审阅合并结果时，除了冲突清单，还可能需要知道**最终文档里每一处实际变更来自哪一方**。
+请求可携带可选布尔字段 `includeProvenance`（也接受别名 `include_provenance`，默认 `false`）。
+开启后，响应在 `merged` / `conflicts` 之外**新增**一个 `provenance` 数组；不开启时
+**响应格式完全不变**（不会出现 `"provenance": null`，连键都不存在）。
+
+`provenance` 中**每个实际发生变更的叶**（或每个对象数组的**项**）对应一条记录：
+
+```json
+{
+  "pointer": "/servers/1/port",
+  "source": "right",
+  "adjudicated": false,
+  "deleted": false
+}
+```
+
+| 字段 | 含义 |
+| --- | --- |
+| `pointer` | 变更叶 / 数组项在**最终合并结果**中的 JSON Pointer (RFC 6901)。整个数组按最终 JSON Pointer 字符串**稳定升序**排列。 |
+| `source` | 最终值的来源：`left` / `right`（单侧改动，或裁决给该侧）、`base`（未裁决冲突或 `protectedPaths` 冻结而保留 base）、`merged`（两侧做出**相同**改动，或身份数组项由两侧字段拼装）。 |
+| `adjudicated` | 该结果（含删除）是否由 `conflictResolutions` 的裁决产生；自动合并与未裁决冲突为 `false`。字段级裁决会使其所在的身份数组项记录标为 `true`。 |
+| `deleted` | 该叶 / 项是否已从最终文档删除。删除项**保留其在 base 中的原始指针**（不是最终下标），`source` 为执行删除的一侧；两侧都删除时为 `merged`。 |
+
+记录粒度与合并引擎一致：
+
+- 对象按字段递归，记录到**叶值**；未配置身份字段的普通数组是**整体值**，整条数组记一条；
+- 配置了 `arrayIdentity` 的对象数组**按项**记录（一项一条，不逐字段展开），
+  项下字段的来源综合为该项的 `source`，项指针使用该项在最终数组中的**最终下标**
+  （先于它的项被删除导致下标前移时，以最终下标为准）；
+- base 与最终文档中都不存在的位置（被拦回的新增、或 `both_added` 裁决为 `base`）
+  没有最终指针，不产生记录——该次尝试仍体现在 `conflicts` 中；
+- 未发生变更的叶不记录；空对象的增删本身记为一条叶记录。
+
+溯源与其它机制严格一致：它描述的就是 `merged` 的最终结果，因此天然与 `protectedPaths`
+（冻结即 `source: "base"`）、`redactPaths`（只脱敏 `conflicts`，不影响 `merged`，故不影响溯源）
+以及 `conflictResolutions`（裁决结果与 `adjudicated` 标记）保持一致。
+
+溯源示例（单侧改动、两侧相同改动、未裁决冲突各一条）：
+
+```bash
+curl -s -X POST http://localhost:8000/merge \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "base":  {"a": 1, "b": 2, "c": 3},
+    "left":  {"a": 10, "b": 2, "c": 33},
+    "right": {"a": 1, "b": 20, "c": 33},
+    "includeProvenance": true
+  }'
+```
+
+响应（`/a` 来自 left、`/b` 来自 right、`/c` 两侧相同改动记为 merged；未变更字段不出现）：
+
+```json
+{
+  "merged": {"a": 10, "b": 20, "c": 33},
+  "conflicts": [],
+  "provenance": [
+    {"pointer": "/a", "source": "left", "adjudicated": false, "deleted": false},
+    {"pointer": "/b", "source": "right", "adjudicated": false, "deleted": false},
+    {"pointer": "/c", "source": "merged", "adjudicated": false, "deleted": false}
+  ]
+}
+```
+
+身份数组示例（删除项保留原指针，存活项用最终下标）：
+
+```bash
+curl -s -X POST http://localhost:8000/merge \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "base":  {"servers": [{"id": "a", "port": 8080}, {"id": "b", "port": 80}]},
+    "left":  {"servers": [{"id": "b", "port": 80}]},
+    "right": {"servers": [{"id": "a", "port": 8080}, {"id": "b", "port": 81}]},
+    "arrayIdentity": {"/servers": "id"},
+    "includeProvenance": true
+  }'
+```
+
+响应：
+
+```json
+{
+  "merged": {"servers": [{"id": "b", "port": 81}]},
+  "conflicts": [],
+  "provenance": [
+    {"pointer": "/servers/0", "source": "left", "adjudicated": false, "deleted": true},
+    {"pointer": "/servers/0", "source": "right", "adjudicated": false, "deleted": false}
+  ]
+}
+```
+
+删除项 `a` 保留其原始指针 `/servers/0`（`deleted: true`）；存活项 `b` 删除后位于最终
+下标 `0`，也显示为 `/servers/0`（`deleted: false`）——两条记录按指针相邻排列。
+被接受的删除同样可以来自裁决（此时 `source` 为裁决方且 `adjudicated: true`）。
+
 ### 对象数组与身份字段
 
 在 `arrayIdentity` 中声明“数组指针 → 身份字段名”：
@@ -168,7 +278,9 @@ reference token 比较，`/a~0b` 与等价写法视为重复）。数组元素�
 `arrayIdentity`（也接受别名 `array_identity`）为“指针 → 字段名”映射，可省略；
 `conflictResolutions`（也接受别名 `conflict_resolutions`）为冲突裁决列表，可省略；
 `protectedPaths`（也接受别名 `protected_paths`）为受保护指针数组，可省略；
-`redactPaths`（也接受别名 `redact_paths`）为冲突值脱敏指针数组，可省略。
+`redactPaths`（也接受别名 `redact_paths`）为冲突值脱敏指针数组，可省略；
+`includeProvenance`（也接受别名 `include_provenance`）为布尔值，可省略（默认 `false`），
+开启后响应额外返回按最终指针排序的 `provenance` 数组（见“合并溯源”一节）。
 
 请求：
 

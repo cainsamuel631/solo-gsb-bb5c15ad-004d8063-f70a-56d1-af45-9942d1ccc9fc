@@ -3,11 +3,17 @@
 from __future__ import annotations
 
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import JSONResponse
 
 from .config import settings
 from .merger import Merger, parse_pointer
 from .middleware import RequestSizeLimitMiddleware
-from .models import Conflict, MergeRequest, MergeResponse
+from .models import (
+    Conflict,
+    MergeRequest,
+    MergeResponse,
+    ProvenanceEntry,
+)
 
 app = FastAPI(
     title="Three-way JSON Merge API",
@@ -26,11 +32,17 @@ app = FastAPI(
         "'redactPaths' masks sensitive values in the reported conflicts "
         "only: base/left/right values at (or below) a listed pointer are "
         "replaced with '[REDACTED]', while 'merged', conflict detection "
-        "and adjudication keep using the original values. Without "
-        "redaction the response conflicts always keep the original "
+        "and adjudication keep using the original values. With "
+        "'includeProvenance' the response additionally carries a "
+        "'provenance' array recording, for every actual changed leaf or "
+        "identity-array item, the side its final value came from "
+        "(base, left, right, merged), whether a conflict adjudication "
+        "produced it, and whether it was deleted; records are sorted by "
+        "final JSON Pointer (deleted items keep their original pointer). "
+        "Without redaction the response conflicts always keep the original "
         "three-way values."
     ),
-    version="1.3.0",
+    version="1.4.0",
 )
 app.add_middleware(
     RequestSizeLimitMiddleware,
@@ -49,7 +61,7 @@ async def health() -> dict[str, str]:
     tags=["merge"],
     summary="Three-way merge of JSON documents",
 )
-async def merge(request: MergeRequest) -> MergeResponse:
+async def merge(request: MergeRequest):
     # Validate pointers up front so malformed configuration produces a clear
     # 4xx response instead of an opaque error.
     for pointer in request.array_identity:
@@ -130,9 +142,15 @@ async def merge(request: MergeRequest) -> MergeResponse:
         resolutions[entry.pointer] = entry.resolution
 
     try:
-        merged, raw_conflicts = merger.merge(
-            request.base, request.left, request.right, resolutions
-        )
+        if request.include_provenance:
+            merged, raw_conflicts, raw_provenance = merger.merge_with_provenance(
+                request.base, request.left, request.right, resolutions
+            )
+        else:
+            merged, raw_conflicts = merger.merge(
+                request.base, request.left, request.right, resolutions
+            )
+            raw_provenance = []
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     conflicts = [
@@ -145,4 +163,23 @@ async def merge(request: MergeRequest) -> MergeResponse:
         )
         for conflict in raw_conflicts
     ]
-    return MergeResponse(merged=merged, conflicts=conflicts)
+    provenance = [
+        ProvenanceEntry(
+            pointer=record.path,
+            source=record.source,
+            adjudicated=record.adjudicated,
+            deleted=record.deleted,
+        )
+        for record in raw_provenance
+    ] if request.include_provenance else None
+
+    # Serialize directly: with provenance disabled the response must be
+    # byte-for-byte the old two-key envelope (no "provenance": null), while
+    # an enabled request always includes the array, even when empty.
+    if request.include_provenance:
+        body = MergeResponse(
+            merged=merged, conflicts=conflicts, provenance=provenance
+        ).model_dump()
+    else:
+        body = {"merged": merged, "conflicts": [c.model_dump() for c in conflicts]}
+    return JSONResponse(body)
