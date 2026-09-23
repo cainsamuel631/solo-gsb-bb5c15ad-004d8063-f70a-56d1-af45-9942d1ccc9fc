@@ -754,6 +754,415 @@ def test_redact_paths_appear_in_openapi_schema():
     assert "[REDACTED]" in properties["redactPaths"]["description"]
 
 
+# --------------------------------------------------------- includeProvenance
+
+
+def _provenance(body):
+    return {(p["pointer"], p["source"], p["adjudicated"], p["deleted"])
+            for p in body["provenance"]}
+
+
+def test_provenance_absent_from_response_by_default():
+    payload = {
+        "base": {"a": 1, "b": 2, "c": 3},
+        "left": {"a": 10, "b": 2, "c": 3},
+        "right": {"a": 1, "b": 20, "c": 3},
+    }
+    response = client.post("/merge", json=payload)
+    assert response.status_code == 200
+    # The unextended envelope keeps exactly the original two keys, in the
+    # original order.
+    assert list(response.json().keys()) == ["merged", "conflicts"]
+
+
+def test_provenance_absent_when_explicitly_false():
+    response = client.post(
+        "/merge",
+        json={
+            "base": {"a": 1}, "left": {"a": 2}, "right": {"a": 1},
+            "includeProvenance": False,
+        },
+    )
+    assert response.status_code == 200
+    assert list(response.json().keys()) == ["merged", "conflicts"]
+
+
+def test_provenance_empty_array_when_nothing_changed():
+    response = client.post(
+        "/merge",
+        json={
+            "base": {"a": 1}, "left": {"a": 1}, "right": {"a": 1},
+            "includeProvenance": True,
+        },
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["merged"] == {"a": 1}
+    assert body["conflicts"] == []
+    assert body["provenance"] == []
+
+
+def test_provenance_attributes_simple_leaves_and_is_pointer_sorted():
+    payload = {
+        # a: left-only edit; b: identical two-sided edit;
+        # c: deleted on both sides; d: right-only delete;
+        # e: right-only edit to null; x: left-only addition.
+        "base": {"a": 1, "b": 2, "c": 3, "d": 4, "e": 5},
+        "left": {"a": 10, "b": 9, "d": 4, "e": 5, "x": 7},
+        "right": {"a": 1, "b": 9, "e": None, "x": 7},
+        "includeProvenance": True,
+    }
+    response = client.post("/merge", json=payload)
+    assert response.status_code == 200
+    body = response.json()
+    assert body["merged"] == {"a": 10, "b": 9, "e": None, "x": 7}
+    assert body["conflicts"] == []
+    assert [p["pointer"] for p in body["provenance"]] == [
+        "/a", "/b", "/c", "/d", "/e", "/x"
+    ]
+    assert _provenance(body) == {
+        ("/a", "left", False, False),
+        ("/b", "merged", False, False),
+        ("/c", "merged", False, True),
+        ("/d", "right", False, True),
+        ("/e", "right", False, False),
+        ("/x", "merged", False, False),
+    }
+    # Every record carries the full field set.
+    for entry in body["provenance"]:
+        assert set(entry) == {"pointer", "source", "adjudicated", "deleted"}
+
+
+def test_provenance_unresolved_conflict_keeps_base_unadjudicated():
+    response = client.post(
+        "/merge",
+        json={
+            "base": {"a": 1}, "left": {"a": 2}, "right": {"a": 3},
+            "includeProvenance": True,
+        },
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["merged"] == {"a": 1}
+    assert body["provenance"] == [
+        {"pointer": "/a", "source": "base",
+         "adjudicated": False, "deleted": False}
+    ]
+
+
+def test_provenance_marks_explicit_resolutions_as_adjudicated():
+    payload = {
+        "base": {"a": 1, "b": 1},
+        "left": {"a": 2, "b": 2},
+        "right": {"a": 3, "b": 3},
+        "conflictResolutions": [
+            {"pointer": "/a", "resolution": "right"},
+            {"pointer": "/b", "resolution": "left"},
+        ],
+        "includeProvenance": True,
+    }
+    response = client.post("/merge", json=payload)
+    assert response.status_code == 200
+    body = response.json()
+    assert body["merged"] == {"a": 3, "b": 2}
+    assert _provenance(body) == {
+        ("/a", "right", True, False),
+        ("/b", "left", True, False),
+    }
+
+
+def test_provenance_explicit_base_resolution_is_not_adjudicated():
+    # Adjudicating to the base side yields the very same document the
+    # unresolved default would, so it is not flagged as adjudicated.
+    response = client.post(
+        "/merge",
+        json={
+            "base": {"a": 1}, "left": {"a": 2}, "right": {"a": 3},
+            "conflictResolutions": [{"pointer": "/a", "resolution": "base"}],
+            "includeProvenance": True,
+        },
+    )
+    body = response.json()
+    assert body["merged"] == {"a": 1}
+    assert body["provenance"] == [
+        {"pointer": "/a", "source": "base",
+         "adjudicated": False, "deleted": False}
+    ]
+
+
+def test_provenance_adjudicated_deletion_records_deleted_with_side():
+    response = client.post(
+        "/merge",
+        json={
+            "base": {"a": 1}, "left": {}, "right": {"a": 9},
+            "conflictResolutions": [{"pointer": "/a", "resolution": "left"}],
+            "includeProvenance": True,
+        },
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["merged"] == {}
+    assert body["provenance"] == [
+        {"pointer": "/a", "source": "left",
+         "adjudicated": True, "deleted": True}
+    ]
+
+
+def test_provenance_withheld_both_added_adjudication_has_no_record():
+    # base carries nothing at /a: adjudicating a both_added conflict to
+    # 'base' withholds the addition, so no changed unit exists.
+    response = client.post(
+        "/merge",
+        json={
+            "base": {}, "left": {"a": 1}, "right": {"a": 2},
+            "conflictResolutions": [{"pointer": "/a", "resolution": "base"}],
+            "includeProvenance": True,
+        },
+    )
+    body = response.json()
+    assert body["merged"] == {}
+    assert body["provenance"] == []
+
+
+def test_provenance_protected_paths_keep_base_unadjudicated():
+    payload = {
+        "base": {"a": 1, "b": 2},
+        "left": {"a": 99, "b": 2},
+        "right": {"a": 1, "b": 20},
+        "protectedPaths": ["/a"],
+        "includeProvenance": True,
+    }
+    response = client.post("/merge", json=payload)
+    assert response.status_code == 200
+    body = response.json()
+    assert body["merged"] == {"a": 1, "b": 20}
+    assert _provenance(body) == {
+        ("/a", "base", False, False),
+        ("/b", "right", False, False),
+    }
+
+
+def test_provenance_protected_resolution_is_adjudicated():
+    payload = {
+        "base": {"a": 1}, "left": {"a": 9}, "right": {"a": 1},
+        "protectedPaths": ["/a"],
+        "conflictResolutions": [{"pointer": "/a", "resolution": "left"}],
+        "includeProvenance": True,
+    }
+    response = client.post("/merge", json=payload)
+    assert response.status_code == 200
+    body = response.json()
+    assert body["merged"] == {"a": 9}
+    assert body["provenance"] == [
+        {"pointer": "/a", "source": "left",
+         "adjudicated": True, "deleted": False}
+    ]
+
+
+def test_provenance_identity_arrays_use_final_and_original_indices():
+    payload = {
+        # a: left deletes it, right modifies it -> conflict, default base
+        #    kept at final index 0; adjudicating accepts right's item.
+        # b: right-only field edit -> accepted.
+        # c: deleted on both sides -> removed (its record keeps the
+        #    original base index 2).
+        # d: right-only addition -> appended at final index 2.
+        # e: left-only addition -> appended at final index 3.
+        "base": {"srv": [
+            {"id": "a", "v": 1}, {"id": "b", "v": 2}, {"id": "c", "v": 3},
+        ]},
+        "left": {"srv": [
+            {"id": "b", "v": 2}, {"id": "e", "v": 9},
+        ]},
+        "right": {"srv": [
+            {"id": "a", "v": 99}, {"id": "b", "v": 20}, {"id": "d", "v": 8},
+        ]},
+        "arrayIdentity": {"/srv": "id"},
+        "conflictResolutions": [{"pointer": "/srv/0", "resolution": "right"}],
+        "includeProvenance": True,
+    }
+    response = client.post("/merge", json=payload)
+    assert response.status_code == 200
+    body = response.json()
+    assert body["merged"] == {"srv": [
+        {"id": "a", "v": 99},
+        {"id": "b", "v": 20},
+        {"id": "d", "v": 8},
+        {"id": "e", "v": 9},
+    ]}
+    assert _provenance(body) == {
+        ("/srv/0", "right", True, False),       # a: adjudicated conflict
+        ("/srv/1/v", "right", False, False),    # b's right-only edit
+        ("/srv/2", "right", False, False),       # added d at final index 2
+        ("/srv/2", "merged", False, True),        # c deleted on both; original 2
+        ("/srv/3", "left", False, False),        # added e
+    }
+    # Surviving units sort before the deleted record sharing the pointer.
+    pointers = [p["pointer"] for p in body["provenance"]]
+    assert pointers == ["/srv/0", "/srv/1/v", "/srv/2", "/srv/2", "/srv/3"]
+    assert body["provenance"][2]["deleted"] is False
+    assert body["provenance"][3]["deleted"] is True
+
+
+def test_provenance_identity_item_field_adjudication_tracks_final_index():
+    payload = {
+        "base": {"srv": [{"id": "a", "v": 1}, {"id": "b", "v": 1}]},
+        "left": {"srv": [{"id": "b", "v": 11}]},  # deletes a, edits b.v
+        "right": {"srv": [{"id": "a", "v": 9}, {"id": "b", "v": 12}]},
+        "arrayIdentity": {"/srv": "id"},
+        "conflictResolutions": [
+            {"pointer": "/srv/0", "resolution": "left"},    # accept deleting a
+            {"pointer": "/srv/1/v", "resolution": "right"},
+        ],
+        "includeProvenance": True,
+    }
+    response = client.post("/merge", json=payload)
+    assert response.status_code == 200
+    body = response.json()
+    assert body["merged"] == {"srv": [{"id": "b", "v": 12}]}
+    assert _provenance(body) == {
+        # a accepted-deleted by the adjudication: original base index 0.
+        ("/srv/0", "left", True, True),
+        # b lands at final index 0; its field conflict was reported at /srv/1/v
+        # but the provenance leaf uses its final pointer.
+        ("/srv/0/v", "right", True, False),
+    }
+
+
+def test_provenance_nested_identity_array_pointers():
+    payload = {
+        "base": {"servers": [
+            {"id": "s1", "disks": [
+                {"name": "d1", "size": 10}, {"name": "d2", "size": 20},
+            ]},
+        ]},
+        "left": {"servers": [
+            {"id": "s1", "disks": [{"name": "d1", "size": 100}]},
+        ]},
+        "right": {"servers": [
+            {"id": "s1", "disks": [
+                {"name": "d1", "size": 10}, {"name": "d3", "size": 30},
+            ]},
+        ]},
+        "arrayIdentity": {
+            "/servers": "id", "/servers/*/disks": "name",
+        },
+        "includeProvenance": True,
+    }
+    response = client.post("/merge", json=payload)
+    assert response.status_code == 200
+    body = response.json()
+    assert _provenance(body) == {
+        ("/servers/0/disks/0/size", "left", False, False),
+        ("/servers/0/disks/1", "right", False, False),
+        ("/servers/0/disks/1", "merged", False, True),
+    }
+
+
+def test_provenance_plain_arrays_are_one_atomic_unit():
+    payload = {
+        "base": {"a": [1, 2]},
+        "left": {"a": [1, 2, 3]},
+        "right": {"a": [1, 2]},
+        "includeProvenance": True,
+    }
+    response = client.post("/merge", json=payload)
+    assert response.status_code == 200
+    body = response.json()
+    assert body["merged"] == {"a": [1, 2, 3]}
+    assert body["provenance"] == [
+        {"pointer": "/a", "source": "left",
+         "adjudicated": False, "deleted": False}
+    ]
+
+
+def test_provenance_root_conflict_uses_empty_pointer():
+    response = client.post(
+        "/merge",
+        json={
+            "base": 1, "left": 2, "right": 3,
+            "conflictResolutions": [{"pointer": "", "resolution": "right"}],
+            "includeProvenance": True,
+        },
+    )
+    body = response.json()
+    assert body["merged"] == 3
+    assert body["provenance"] == [
+        {"pointer": "", "source": "right",
+         "adjudicated": True, "deleted": False}
+    ]
+
+
+def test_provenance_consistent_with_redact_paths():
+    # Redaction masks only the reported conflict values; provenance still
+    # records the unit and records no values of its own.
+    payload = {
+        "base": {"a": 1, "b": 1},
+        "left": {"a": 2, "b": 2},
+        "right": {"a": 3, "b": 3},
+        "redactPaths": ["/a"],
+        "conflictResolutions": [{"pointer": "/a", "resolution": "left"}],
+        "includeProvenance": True,
+    }
+    response = client.post("/merge", json=payload)
+    assert response.status_code == 200
+    body = response.json()
+    assert body["merged"] == {"a": 2, "b": 1}
+    assert body["conflicts"][0] == {
+        "pointer": "/a", "kind": "both_modified",
+        "base": "[REDACTED]", "left": "[REDACTED]", "right": "[REDACTED]",
+    }
+    assert _provenance(body) == {
+        ("/a", "left", True, False),
+        ("/b", "base", False, False),
+    }
+
+
+def test_provenance_accepts_snake_case_alias():
+    response = client.post(
+        "/merge",
+        json={
+            "base": {"a": 1}, "left": {"a": 2}, "right": {"a": 1},
+            "include_provenance": True,
+        },
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["provenance"] == [
+        {"pointer": "/a", "source": "left",
+         "adjudicated": False, "deleted": False}
+    ]
+
+
+def test_provenance_flag_must_be_boolean():
+    response = client.post(
+        "/merge",
+        json={
+            "base": 1, "left": 1, "right": 1, "includeProvenance": "true",
+        },
+    )
+    assert response.status_code == 422
+
+
+def test_provenance_entry_rejects_unknown_fields_in_schema():
+    # The response model itself is exercised indirectly: assert the
+    # generated schema enumerates exactly the four provenance properties.
+    schema = client.get("/openapi.json").json()
+    props = schema["components"]["schemas"]["ProvenanceEntry"]["properties"]
+    assert set(props) == {"pointer", "source", "adjudicated", "deleted"}
+    assert set(props["source"]["enum"]) == {"base", "left", "right", "merged"}
+
+
+def test_include_provenance_appears_in_openapi_schema():
+    schema = client.get("/openapi.json").json()
+    properties = schema["components"]["schemas"]["MergeRequest"]["properties"]
+    assert "includeProvenance" in properties
+    response_props = schema["components"]["schemas"]["MergeResponse"]["properties"]
+    assert "provenance" in response_props
+    # provenance is not a required response key (omitted unless requested).
+    assert "provenance" not in schema["components"]["schemas"]["MergeResponse"]["required"]
+
+
 # ------------------------------------------------------------- size limiting
 
 

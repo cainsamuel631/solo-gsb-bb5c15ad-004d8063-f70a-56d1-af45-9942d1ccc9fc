@@ -7,7 +7,7 @@ from fastapi import FastAPI, HTTPException
 from .config import settings
 from .merger import Merger, parse_pointer
 from .middleware import RequestSizeLimitMiddleware
-from .models import Conflict, MergeRequest, MergeResponse
+from .models import Conflict, MergeRequest, MergeResponse, ProvenanceEntry
 
 app = FastAPI(
     title="Three-way JSON Merge API",
@@ -28,9 +28,13 @@ app = FastAPI(
         "replaced with '[REDACTED]', while 'merged', conflict detection "
         "and adjudication keep using the original values. Without "
         "redaction the response conflicts always keep the original "
-        "three-way values."
+        "three-way values. Set 'includeProvenance' to true to additionally "
+        "receive a pointer-sorted 'provenance' array naming, for every "
+        "actual changed leaf or identity-array item, which side the final "
+        "value came from (base/left/right/merged), whether it was produced "
+        "by a conflict adjudication, and whether the unit was deleted."
     ),
-    version="1.3.0",
+    version="1.4.0",
 )
 app.add_middleware(
     RequestSizeLimitMiddleware,
@@ -130,7 +134,7 @@ async def merge(request: MergeRequest) -> MergeResponse:
         resolutions[entry.pointer] = entry.resolution
 
     try:
-        merged, raw_conflicts = merger.merge(
+        merged, raw_conflicts, raw_provenance = merger.merge_with_provenance(
             request.base, request.left, request.right, resolutions
         )
     except ValueError as exc:
@@ -145,4 +149,15 @@ async def merge(request: MergeRequest) -> MergeResponse:
         )
         for conflict in raw_conflicts
     ]
-    return MergeResponse(merged=merged, conflicts=conflicts)
+    provenance = None
+    if request.include_provenance:
+        provenance = [
+            ProvenanceEntry(
+                pointer=record.path,
+                source=record.source,
+                adjudicated=record.adjudicated,
+                deleted=record.deleted,
+            )
+            for record in raw_provenance
+        ]
+    return MergeResponse(merged=merged, conflicts=conflicts, provenance=provenance)

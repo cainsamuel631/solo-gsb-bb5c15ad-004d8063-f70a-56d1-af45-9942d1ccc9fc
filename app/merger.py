@@ -47,6 +47,20 @@ Sides on which the location is absent stay ``null``. Redaction only
 rewrites the returned conflicts -- the merged document, conflict detection
 and resolutions always use the original values.
 
+:meth:`Merger.merge_with_provenance` additionally returns provenance
+records: one record per changed scalar leaf (or whole atomic plain-array
+value) and per added / removed / whole-item-adjudicated identity-array
+item. Each record names the side the final value came from (``base`` when
+a conflict or protection froze the base value, ``left`` / ``right`` for a
+single winning side, ``merged`` for a value both sides arrived at
+together, including an identical two-sided change or a two-sided
+deletion), whether the outcome was produced by an explicit conflict
+resolution (``adjudicated``), and whether the unit is absent from the
+final document (``deleted``). Records are sorted by their final JSON
+Pointer; object-array items use their final index, deleted items keep
+their original base index. The records carry no values, so redactPaths
+neither masks nor removes them.
+
 The merge result is deterministic for identical inputs.
 """
 
@@ -86,6 +100,23 @@ class RawConflict(NamedTuple):
     base: Any
     left: Any
     right: Any
+
+
+class RawProvenance(NamedTuple):
+    """One provenance record, keyed by an internal merge-time path.
+
+    *source* is ``"base"`` (a conflict/protection froze the base value),
+    ``"left"`` / ``"right"`` (one side supplied the final value) or
+    ``"merged"`` (both sides arrived at the value together, or removed it
+    together). *adjudicated* marks outcomes produced by an explicit
+    conflict resolution; *deleted* marks units absent from the final
+    document (their pointer keeps the original base location).
+    """
+
+    path: tuple
+    source: str
+    adjudicated: bool
+    deleted: bool
 
 
 class Merger:
@@ -158,6 +189,21 @@ class Merger:
     ) -> tuple[Any, list[RawConflict]]:
         """Merge *left* and *right* against *base*.
 
+        Shorthand for :meth:`merge_with_provenance` that returns only the
+        merged document and the (possibly redacted) conflicts.
+        """
+        merged, conflicts, _ = self.merge_with_provenance(base, left, right, resolutions)
+        return merged, conflicts
+
+    def merge_with_provenance(
+        self,
+        base: Any,
+        left: Any,
+        right: Any,
+        resolutions: Optional[dict[str, str]] = None,
+    ) -> tuple[Any, list[RawConflict], list[RawProvenance]]:
+        """Merge *left* and *right* against *base*, with provenance.
+
         *resolutions* optionally maps a conflict pointer (RFC 6901, exactly
         as it appears in the returned conflicts) to the side whose value is
         placed at the conflict location: ``"base"``, ``"left"`` or
@@ -171,15 +217,15 @@ class Merger:
         resolutions.
 
         Values matched by the merger's redact paths are masked in the
-        returned conflicts only; *merged* and conflict detection always
-        use the original values.
+        returned conflicts only; *merged*, conflict detection, resolutions
+        and the provenance records always use the original values.
         """
         # Pass 1: plain merge. Its output locates where every change ends
         # up, and a parallel walk enumerates every changed logical path so
         # we can tell which configured protectedPaths actually hit a
         # left/right change (shortcuts like one-sided edits would otherwise
         # skip subtree traversal).
-        merged, raw = self._merge_pass(base, left, right, resolutions=None)
+        merged_plain, raw = self._merge_pass(base, left, right, resolutions=None)
         changed = self._enumerate_changes(base, left, right, ())
 
         protected: set[tuple] = set()
@@ -196,7 +242,7 @@ class Merger:
             # Fields of objects and of identity-array items match by their
             # final reported pointer: match the rendered pointer too so a
             # concrete index lines up with the configured pattern.
-            pointer = _render_path(merged, base, base, path)
+            pointer = _render_path(merged_plain, base, base, path)
             if self._is_protected(parse_pointer(pointer)):
                 protected.add(path)
 
@@ -208,7 +254,7 @@ class Merger:
             base, left, right, resolutions=None, protected=frozenset(protected),
         )
         resolved = self._resolve_paths(
-            merged_kept, merged, base, [c.path for c in raw]
+            merged_kept, merged_plain, base, [c.path for c in raw]
         )
 
         if resolutions:
@@ -234,12 +280,12 @@ class Merger:
                         _unknown_resolution_message(pointer, tokens, merged_kept)
                     )
                 logical[conflict_path] = side
-            merged, _ = self._merge_pass(
+            merged_final, _ = self._merge_pass(
                 base, left, right,
                 resolutions=logical, protected=frozenset(protected),
             )
         else:
-            merged = merged_kept
+            merged_final = merged_kept
 
         ordered = sorted(
             zip(resolved, raw),
@@ -262,7 +308,15 @@ class Merger:
                     right=_public(right_value),
                 )
             )
-        return merged, final_conflicts
+
+        # Provenance walks the original three-way documents and the actual
+        # final outcome (never the redacted conflict snapshots), so it stays
+        # consistent with protectedPaths and conflictResolutions and is
+        # unaffected by redactPaths.
+        provenance = self._build_provenance(
+            base, left, right, merged_kept, merged_final
+        )
+        return merged_final, final_conflicts, provenance
 
     def _merge_pass(
         self,
@@ -1047,6 +1101,319 @@ class Merger:
             _redact_within(right, relatives),
         )
 
+    # --------------------------------------------------------- provenance
+
+    def _build_provenance(
+        self,
+        base: Any,
+        left: Any,
+        right: Any,
+        kept: Any,
+        final: Any,
+    ) -> list[RawProvenance]:
+        """Provenance records for every actual changed leaf / array item.
+
+        *kept* is the protected merge without resolutions (the default
+        outcome); *final* is the document after explicit resolutions. A
+        unit whose final value differs from *kept* was produced by a
+        conflict adjudication. Records are returned sorted by their final
+        JSON Pointer.
+        """
+        records: list[RawProvenance] = []
+        self._prove_walk(base, left, right, kept, final, (), records)
+        rendered = []
+        for record in records:
+            pointer = self._render_provenance_path(final, base, record.path)
+            rendered.append((pointer, record))
+        # Primary order is the final JSON Pointer. A deleted base item and
+        # an added survivor can share one rendered pointer when an earlier
+        # delete shifted indices (e.g. nested identity arrays): break the
+        # tie deterministically, surviving unit before the deleted one,
+        # then by source and adjudication.
+        rendered.sort(
+            key=lambda pair: (
+                pair[0],
+                pair[1].deleted,
+                pair[1].source,
+                pair[1].adjudicated,
+            )
+        )
+        return [
+            RawProvenance(
+                path=pointer,
+                source=record.source,
+                adjudicated=record.adjudicated,
+                deleted=record.deleted,
+            )
+            for pointer, record in rendered
+        ]
+
+    def _prove_walk(
+        self,
+        base: Any,
+        left: Any,
+        right: Any,
+        kept: Any,
+        final: Any,
+        path: tuple,
+        records: list[RawProvenance],
+    ) -> None:
+        """Recursively attribute one provenance unit per changed leaf."""
+        # Nothing changed on either side at or below this location: the
+        # unit is absent from provenance even when protection or a
+        # resolution rewrote it internally in some other shape.
+        if json_equal(left, base) and json_equal(right, base):
+            return
+
+        lists = _maybe_lists(base, left, right)
+        if lists is not None and (left is not MISSING or right is not MISSING):
+            base_list, left_list, right_list = lists
+            id_key = self._identity_key(path)
+            if id_key is not None and _identity_eligible(
+                base_list, left_list, right_list, id_key
+            ) and (
+                base is not MISSING
+                or self._protected_pattern_under(path)
+                or not (left is MISSING or right is MISSING)
+            ):
+                kept_list = kept if isinstance(kept, list) else []
+                final_list = final if isinstance(final, list) else []
+                self._prove_identity_array(
+                    base_list, left_list, right_list, kept_list, final_list,
+                    path, id_key, records,
+                )
+                return
+
+        if _prove_as_dicts(base, left, right):
+            base_is_obj = isinstance(base, dict)
+            base_obj = base if base_is_obj else {}
+            left_obj = left if isinstance(left, dict) else {}
+            right_obj = right if isinstance(right, dict) else {}
+            kept_obj = kept if isinstance(kept, dict) else {}
+            final_obj = final if isinstance(final, dict) else {}
+            # An object subtree both sides wholly removed is one deleted
+            # unit at its own pointer (matching the merge's atomic
+            # deletion). At the document root there is no block pointer,
+            # so the vanished leaves fall through and record individually.
+            if (
+                base_is_obj
+                and not left_obj
+                and not right_obj
+                and path != ()
+            ):
+                self._prove_leaf(
+                    base, left, right, kept, final, path, records
+                )
+                return
+            for key in sorted(set(base_obj) | set(left_obj) | set(right_obj)):
+                self._prove_walk(
+                    base_obj.get(key, MISSING),
+                    left_obj.get(key, MISSING),
+                    right_obj.get(key, MISSING),
+                    kept_obj.get(key, MISSING),
+                    final_obj.get(key, MISSING),
+                    path + (key,),
+                    records,
+                )
+            return
+
+        # Scalar leaf, plain (atomic) array, or a type-swap: one unit.
+        self._prove_leaf(base, left, right, kept, final, path, records)
+
+    def _prove_leaf(
+        self,
+        base: Any,
+        left: Any,
+        right: Any,
+        kept: Any,
+        final: Any,
+        path: tuple,
+        records: list[RawProvenance],
+    ) -> None:
+        """Emit the provenance record for one terminal unit."""
+        # An addition withheld from the final document (an unresolved
+        # both_added / protected_change, or an explicit 'base'
+        # adjudication for a path base carried nowhere) changes nothing.
+        if final is MISSING and base is MISSING:
+            return
+
+        deleted = final is MISSING
+        if deleted:
+            # The active deleter is the side that no longer carries the
+            # base value (absent here, and differing from base at the
+            # parent selection); a side that merely left the value
+            # untouched still surfaces it here.
+            left_removed = left is MISSING and not json_equal(left, base)
+            right_removed = right is MISSING and not json_equal(right, base)
+            if left_removed and right_removed:
+                source = "merged"  # removed on both sides
+            elif left_removed:
+                source = "left"
+            else:
+                source = "right"
+        elif (
+            left is not MISSING
+            and right is not MISSING
+            and json_equal(final, left)
+            and json_equal(left, right)
+        ):
+            # Both revisions arrived at the same value together.
+            source = "merged"
+        elif base is not MISSING and json_equal(final, base):
+            # The base value is present in the final document unchanged:
+            # it got there because a conflict (or a protected_change) was
+            # not adjudicated away, or because protection froze it.
+            source = "base"
+        elif left is not MISSING and json_equal(final, left):
+            source = "left"
+        elif right is not MISSING and json_equal(final, right):
+            source = "right"
+        else:
+            # Field-wise assembly that combines both sides.
+            source = "merged"
+        records.append(
+            RawProvenance(
+                path=path,
+                source=source,
+                adjudicated=not json_equal(final, kept),
+                deleted=deleted,
+            )
+        )
+
+    def _prove_identity_array(
+        self,
+        base: list,
+        left: list,
+        right: list,
+        kept: list,
+        final: list,
+        path: tuple,
+        id_key: str,
+        records: list[RawProvenance],
+    ) -> None:
+        """Provenance units inside an identity-merged array.
+
+        Removed base items and added items are one record per item (the
+        item's final index for survivors/additions, its original base
+        index when deleted); surviving items are walked field by field so
+        independent field edits keep their own leaves.
+        """
+        base_map = _index_items(base, id_key)
+        left_map = _index_items(left, id_key)
+        right_map = _index_items(right, id_key)
+        kept_map = _index_items(kept, id_key)
+        final_map = _index_items(final, id_key)
+
+        for canon_id, base_item in base_map.items():
+            left_item = left_map.get(canon_id, MISSING)
+            right_item = right_map.get(canon_id, MISSING)
+            kept_item = kept_map.get(canon_id, MISSING)
+            final_item = final_map.get(canon_id, MISSING)
+            marker = IdMarker(id_key, base_item[id_key])
+            item_path = path + (marker,)
+
+            if json_equal(left_item, base_item) and json_equal(right_item, base_item):
+                continue  # untouched item: no records beneath it
+
+            # An item whose identity changed no longer matches in a
+            # revision's index: it is absent there (removed), and the new
+            # identity is handled as an addition below.
+            left_removed = left_item is MISSING and not _any_identity_equal(
+                left, id_key, base_item[id_key]
+            )
+            right_removed = right_item is MISSING and not _any_identity_equal(
+                right, id_key, base_item[id_key]
+            )
+            if left_removed or right_removed:
+                # Deleted on at least one side: the item is one atomic
+                # unit (delete_vs_modify / protected_change / an accepted
+                # deletion), even when its surviving item survived
+                # through a field-wise guarded merge.
+                self._prove_leaf(
+                    base_item, left_item, right_item,
+                    kept_item, final_item, item_path, records,
+                )
+                continue
+
+            if final_item is MISSING:
+                # Both sides carried the item but a resolution dropped it
+                # (currently unreachable through the item-level rules, but
+                # keeps the record truthful if adjudications gain an item
+                # delete for present-on-both items).
+                self._prove_leaf(
+                    base_item, left_item, right_item,
+                    kept_item, final_item, item_path, records,
+                )
+                continue
+
+            # Surviving item present on both sides: walk its fields.
+            self._prove_walk(
+                base_item, left_item, right_item,
+                kept_item if kept_item is not MISSING else {},
+                final_item, item_path, records,
+            )
+
+        new_ids = (set(left_map) | set(right_map)) - set(base_map)
+        for canon_id in new_ids:
+            left_item = left_map.get(canon_id, MISSING)
+            right_item = right_map.get(canon_id, MISSING)
+            present = left_item if left_item is not MISSING else right_item
+            marker = IdMarker(id_key, present[id_key])
+            item_path = path + (marker,)
+            kept_item = kept_map.get(canon_id, MISSING)
+            final_item = final_map.get(canon_id, MISSING)
+            if final_item is MISSING:
+                # An addition withheld entirely (an unresolved both_added
+                # or protected_change, or a 'base' adjudication) leaves the
+                # document exactly as base carried it: no changed unit.
+                continue
+            self._prove_leaf(
+                MISSING, left_item, right_item,
+                kept_item, final_item, item_path, records,
+            )
+
+    @staticmethod
+    def _render_provenance_path(final: Any, base: Any, path: tuple) -> str:
+        """Render an internal path with provenance pointer semantics.
+
+        Object keys and surviving identity-array items render against the
+        final document (final indices); a terminal deleted item renders
+        against the base document (its original index). Each document
+        tracks its own cursor, so an earlier delete can shift an index in
+        one document while a later deleted step is still located in base.
+        """
+        cursors: list[Any] = [final, base]
+        steps: list[str] = []
+        last = len(path) - 1
+        for depth, step in enumerate(path):
+            if isinstance(step, IdMarker):
+                final_idx = _find_identity_or_none(cursors[0], step)
+                base_idx = _find_identity_or_none(cursors[1], step)
+                idx: Optional[int]
+                if depth == last and final_idx is None and base_idx is not None:
+                    idx = base_idx
+                elif final_idx is not None:
+                    idx = final_idx
+                else:
+                    idx = base_idx
+                if idx is None:
+                    raise KeyError(  # unreachable: every marker resolves
+                        f"provenance step {step!r} not found in final or base"
+                    )
+                cursors[0] = cursors[0][final_idx] if final_idx is not None else None
+                cursors[1] = cursors[1][base_idx] if base_idx is not None else None
+                steps.append(escape_token(str(idx)))
+            else:
+                token = str(step)
+                for i, node in enumerate(cursors):
+                    cursors[i] = (
+                        node[token]
+                        if isinstance(node, dict) and token in node
+                        else None
+                    )
+                steps.append(escape_token(token))
+        return "" if not steps else "/" + "/".join(steps)
+
 
 # Sentinel: an identity-array item path carried no protection this pass.
 _UNGUARDED: Any = object()
@@ -1388,6 +1755,42 @@ def _revisions_as_dicts(base: Any, left: Any, right: Any) -> bool:
     ) and (left is not MISSING or right is not MISSING)
 
 
+def _maybe_lists(base: Any, left: Any, right: Any) -> Optional[tuple[list, list, list]]:
+    """Triple of lists for any value combination the merge treats as lists.
+
+    Mirrors the identity-array entry conditions: every present side is a
+    list (or absent), and at least one revision carries one.
+    """
+    if not (base is MISSING or isinstance(base, list)):
+        return None
+    if not (left is MISSING or isinstance(left, list)):
+        return None
+    if not (right is MISSING or isinstance(right, list)):
+        return None
+    if left is MISSING and right is MISSING:
+        return None
+    return (
+        base if isinstance(base, list) else [],
+        left if isinstance(left, list) else [],
+        right if isinstance(right, list) else [],
+    )
+
+
+def _prove_as_dicts(base: Any, left: Any, right: Any) -> bool:
+    """Whether provenance should descend field by field here.
+
+    Like :func:`_revisions_as_dicts`, but a node where all three sides
+    are absent never reaches this point, and a two-sided object addition
+    (base absent, both sides objects) also descends so its changed leaves
+    are attributed individually.
+    """
+    if not (base is MISSING or isinstance(base, dict)):
+        return False
+    return (left is MISSING or isinstance(left, dict)) and (
+        right is MISSING or isinstance(right, dict)
+    ) and (left is not MISSING or right is not MISSING)
+
+
 def _descend_at(base: Any, left: Any, right: Any, rel: tuple) -> tuple:
     """Three-way values beneath a structural unit at relative path *rel*.
 
@@ -1437,3 +1840,8 @@ def _find_identity_or_none(items: Any, marker: IdMarker) -> Optional[int]:
         ):
             return i
     return None
+
+
+def _any_identity_equal(items: list, id_key: str, value: Any) -> bool:
+    """Whether any item of *items* carries *value* under *id_key*."""
+    return _find_identity_or_none(items, IdMarker(id_key, value)) is not None

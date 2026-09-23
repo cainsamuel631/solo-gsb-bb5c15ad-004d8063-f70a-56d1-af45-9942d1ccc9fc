@@ -1273,3 +1273,474 @@ def test_duplicate_or_invalid_redact_pointer_is_rejected():
         Merger(None, None, ["/~~", "/~0~0"])
     with pytest.raises(ValueError):
         Merger(None, None, ["a"])
+
+
+# ------------------------------------------------------------- provenance
+
+
+def merge_provenance(base, left, right, identity=None, protected=None,
+                     redact=None, resolutions=None):
+    merged, conflicts, provenance = Merger(
+        identity_map=identity,
+        protected_paths=protected,
+        redact_paths=redact,
+    ).merge_with_provenance(base, left, right, resolutions)
+    return merged, conflicts, [
+        (p.path, p.source, p.adjudicated, p.deleted) for p in provenance
+    ]
+
+
+def test_provenance_plain_leaves_and_sorting():
+    merged, conflicts, provenance = merge_provenance(
+        {"a": 1, "b": 2, "c": 3, "d": 4, "e": 5},
+        {"a": 10, "b": 9, "d": 4, "e": 5, "x": 7},
+        {"a": 1, "b": 9, "e": None},
+    )
+    assert merged == {"a": 10, "b": 9, "e": None, "x": 7}
+    assert conflicts == []
+    assert provenance == [
+        ("/a", "left", False, False),
+        ("/b", "merged", False, False),
+        ("/c", "merged", False, True),
+        ("/d", "right", False, True),
+        ("/e", "right", False, False),
+        ("/x", "left", False, False),
+    ]
+
+
+def test_provenance_empty_when_nothing_changed():
+    _, conflicts, provenance = merge_provenance(
+        {"a": [1, {"b": 2}]}, {"a": [1, {"b": 2}]}, {"a": [1, {"b": 2}]}
+    )
+    assert conflicts == []
+    assert provenance == []
+
+
+def test_provenance_unresolved_conflict_is_base_unadjudicated():
+    merged, _, provenance = merge_provenance({"a": 1}, {"a": 2}, {"a": 3})
+    assert merged == {"a": 1}
+    assert provenance == [("/a", "base", False, False)]
+
+
+def test_provenance_resolutions_set_source_and_adjudicated():
+    merged, _, provenance = merge_provenance(
+        {"a": 1, "b": 1}, {"a": 2, "b": 2}, {"a": 3, "b": 3},
+        resolutions={"/a": "right", "/b": "left"},
+    )
+    assert merged == {"a": 3, "b": 2}
+    assert provenance == [
+        ("/a", "right", True, False),
+        ("/b", "left", True, False),
+    ]
+
+
+def test_provenance_base_resolution_is_not_flagged_adjudicated():
+    merged, _, provenance = merge_provenance(
+        {"a": 1}, {"a": 2}, {"a": 3}, resolutions={"/a": "base"}
+    )
+    assert merged == {"a": 1}
+    assert provenance == [("/a", "base", False, False)]
+
+
+def test_provenance_adjudicated_deletion_names_the_deleting_side():
+    # left deletes, right modifies: accept the deletion.
+    merged, _, provenance = merge_provenance(
+        {"a": 1}, {}, {"a": 9}, resolutions={"/a": "left"}
+    )
+    assert merged == {}
+    assert provenance == [("/a", "left", True, True)]
+
+    # The reverse direction.
+    merged, _, provenance = merge_provenance(
+        {"a": 1}, {"a": 9}, {}, resolutions={"/a": "right"}
+    )
+    assert merged == {}
+    assert provenance == [("/a", "right", True, True)]
+
+
+def test_provenance_withheld_addition_has_no_record():
+    # Unresolved both_added keeps the left value (an actual addition).
+    merged, _, provenance = merge_provenance({}, {"a": 1}, {"a": 2})
+    assert merged == {"a": 1}
+    assert provenance == [("/a", "left", False, False)]
+
+    # Adjudicating the addition to 'base' withholds it: no change at all.
+    merged, _, provenance = merge_provenance(
+        {}, {"a": 1}, {"a": 2}, resolutions={"/a": "base"}
+    )
+    assert merged == {}
+    assert provenance == []
+
+
+def test_provenance_protected_path_keeps_base_unadjudicated():
+    merged, conflicts, provenance = merge_provenance(
+        {"a": 1, "b": 2}, {"a": 9, "b": 2}, {"a": 1, "b": 20},
+        protected=["/a"],
+    )
+    assert merged == {"a": 1, "b": 20}
+    assert [c.kind for c in conflicts] == ["protected_change"]
+    assert provenance == [
+        ("/a", "base", False, False),
+        ("/b", "right", False, False),
+    ]
+
+
+def test_provenance_protected_resolution_is_adjudicated():
+    merged, _, provenance = merge_provenance(
+        {"a": 1}, {"a": 9}, {"a": 1},
+        protected=["/a"],
+        resolutions={"/a": "left"},
+    )
+    assert merged == {"a": 9}
+    assert provenance == [("/a", "left", True, False)]
+
+
+def test_provenance_identity_array_items_and_fields():
+    base = {
+        "srv": [
+            {"id": "a", "v": 1}, {"id": "b", "v": 2}, {"id": "c", "v": 3},
+        ]
+    }
+    left = {"srv": [
+        {"id": "a", "v": 10}, {"id": "c", "v": 3}, {"id": "e", "v": 9},
+    ]}
+    right = {"srv": [
+        {"id": "a", "v": 1}, {"id": "b", "v": 20}, {"id": "d", "v": 8},
+    ]}
+    merged, conflicts, provenance = merge_provenance(
+        base, left, right, {"/srv": "id"}
+    )
+    assert merged == {"srv": [
+        {"id": "a", "v": 10}, {"id": "b", "v": 2},
+        {"id": "d", "v": 8}, {"id": "e", "v": 9},
+    ]}
+    assert [(c.path, c.kind) for c in conflicts] == [
+        ("/srv/1", "delete_vs_modify")
+    ]
+    assert provenance == [
+        ("/srv/0/v", "left", False, False),
+        ("/srv/1", "base", False, False),
+        ("/srv/2", "right", False, False),    # added d at final index 2
+        ("/srv/2", "right", False, True),     # c deleted by right; original 2
+        ("/srv/3", "left", False, False),     # added e
+    ]
+
+
+def test_provenance_identity_item_deleted_on_both_sides():
+    merged, _, provenance = merge_provenance(
+        {"srv": [{"id": "a"}, {"id": "b"}]},
+        {"srv": [{"id": "b"}]},
+        {"srv": [{"id": "b"}]},
+        {"/srv": "id"},
+    )
+    assert merged == {"srv": [{"id": "b"}]}
+    assert provenance == [("/srv/0", "merged", False, True)]
+
+
+def test_provenance_identity_item_adjudicated_delete_and_modify():
+    base = {"srv": [{"id": "a", "v": 1}, {"id": "b", "v": 2}]}
+    left = {"srv": [{"id": "b", "v": 2}]}
+    right = {"srv": [{"id": "a", "v": 99}, {"id": "b", "v": 2}]}
+    merged, _, provenance = merge_provenance(
+        base, left, right, {"/srv": "id"},
+        resolutions={"/srv/0": "left"},
+    )
+    assert merged == {"srv": [{"id": "b", "v": 2}]}
+    assert provenance == [("/srv/0", "left", True, True)]
+
+    merged, _, provenance = merge_provenance(
+        base, left, right, {"/srv": "id"},
+        resolutions={"/srv/0": "right"},
+    )
+    assert merged == {"srv": [{"id": "a", "v": 99}, {"id": "b", "v": 2}]}
+    assert provenance == [("/srv/0", "right", True, False)]
+
+
+def test_provenance_identity_field_edit_is_delete_plus_add():
+    # Changing an identity value removes the old identity and adds a new
+    # one; provenance records both.
+    merged, _, provenance = merge_provenance(
+        {"s": [{"id": "a", "v": 1}]},
+        {"s": [{"id": "a2", "v": 1}]},
+        {"s": [{"id": "a", "v": 1}]},
+        {"/s": "id"},
+    )
+    assert merged == {"s": [{"id": "a2", "v": 1}]}
+    assert provenance == [
+        ("/s/0", "left", False, False),
+        ("/s/0", "left", False, True),
+    ]
+
+
+def test_provenance_nested_identity_arrays_pointer_tie_break():
+    base = {"servers": [
+        {"id": "s1", "disks": [
+            {"name": "d1", "size": 10}, {"name": "d2", "size": 20},
+        ]},
+    ]}
+    left = {"servers": [
+        {"id": "s1", "disks": [{"name": "d1", "size": 100}]},
+    ]}
+    right = {"servers": [
+        {"id": "s1", "disks": [
+            {"name": "d1", "size": 10}, {"name": "d3", "size": 30},
+        ]},
+    ]}
+    merged, _, provenance = merge_provenance(
+        base, left, right,
+        {"/servers": "id", "/servers/*/disks": "name"},
+    )
+    assert merged == {"servers": [
+        {"id": "s1", "disks": [
+            {"name": "d1", "size": 100}, {"name": "d3", "size": 30},
+        ]},
+    ]}
+    assert provenance == [
+        ("/servers/0/disks/0/size", "left", False, False),
+        ("/servers/0/disks/1", "right", False, False),
+        ("/servers/0/disks/1", "merged", False, True),
+    ]
+
+
+def test_provenance_plain_array_is_one_atomic_unit():
+    merged, _, provenance = merge_provenance(
+        {"a": [1, 2]}, {"a": [1, 2, 3]}, {"a": [1, 2]}
+    )
+    assert merged == {"a": [1, 2, 3]}
+    assert provenance == [("/a", "left", False, False)]
+
+    merged, _, provenance = merge_provenance(
+        {"a": [1, 2]}, {"a": [1, 2]}, {}
+    )
+    assert merged == {}
+    assert provenance == [("/a", "right", False, True)]
+
+
+def test_provenance_root_level_units():
+    merged, _, provenance = merge_provenance(1, 2, 1)
+    assert merged == 2
+    assert provenance == [("", "left", False, False)]
+
+    merged, _, provenance = merge_provenance(
+        1, 2, 3, resolutions={"": "right"}
+    )
+    assert merged == 3
+    assert provenance == [("", "right", True, False)]
+
+
+def test_provenance_one_sided_object_addition_walks_its_leaves():
+    merged, _, provenance = merge_provenance(
+        {"k": 1},
+        {"k": 1, "o": {"host": "h", "port": 1}},
+        {"k": 1},
+    )
+    assert merged == {"k": 1, "o": {"host": "h", "port": 1}}
+    assert provenance == [
+        ("/o/host", "left", False, False),
+        ("/o/port", "left", False, False),
+    ]
+
+
+def test_provenance_both_sided_object_deletion_is_one_deleted_unit():
+    merged, _, provenance = merge_provenance(
+        {"o": {"x": 1, "y": 2}, "k": 1}, {"k": 1}, {"k": 1}
+    )
+    assert merged == {"k": 1}
+    assert provenance == [("/o", "merged", False, True)]
+
+
+def test_provenance_protected_one_sided_object_addition_withheld_then_written():
+    # Unresolved: the whole one-sided addition is withheld -> no records.
+    merged, _, provenance = merge_provenance(
+        {"k": 1},
+        {"k": 1, "o": {"secret": "rot", "host": "h"}},
+        {"k": 1},
+        protected=["/o/secret"],
+    )
+    assert merged == {"k": 1}
+    assert provenance == []
+
+    # Adjudicated left: the whole block lands, every leaf adjudicated.
+    merged, _, provenance = merge_provenance(
+        {"k": 1},
+        {"k": 1, "o": {"secret": "rot", "host": "h"}},
+        {"k": 1},
+        protected=["/o/secret"],
+        resolutions={"/o/secret": "left"},
+    )
+    assert merged == {"k": 1, "o": {"secret": "rot", "host": "h"}}
+    assert provenance == [
+        ("/o/host", "left", True, False),
+        ("/o/secret", "left", True, False),
+    ]
+
+
+def test_provenance_protected_one_sided_object_deletion():
+    base = {"o": {"x": 1, "y": 1}}
+    # Unresolved: the block is frozen wholesale at base, so both the hit
+    # field and the untouched sibling survive as base-sourced changed
+    # units (base differed from left, which carried neither).
+    merged, _, provenance = merge_provenance(
+        base, {}, {"o": {"x": 1, "y": 1}}, protected=["/o/x"]
+    )
+    assert merged == base
+    assert provenance == [
+        ("/o/x", "base", False, False),
+        ("/o/y", "base", False, False),
+    ]
+
+    # Adjudicated to the deleting side: every leaf of the removed block is
+    # an adjudicated deletion attributed to that side.
+    merged, _, provenance = merge_provenance(
+        base, {}, {"o": {"x": 1, "y": 1}}, protected=["/o/x"],
+        resolutions={"/o/x": "left"},
+    )
+    assert merged == {}
+    assert provenance == [
+        ("/o/x", "left", True, True),
+        ("/o/y", "left", True, True),
+    ]
+
+
+def test_provenance_protected_identity_item_deletion_kept_then_deleted():
+    base = {"s": [{"id": "a", "v": 1, "w": 2}]}
+    merged, _, provenance = merge_provenance(
+        base, {"s": []}, base, {"/s": "id"}, ["/s/0/v"]
+    )
+    assert merged == base
+    assert provenance == [("/s/0", "base", False, False)]
+
+    merged, _, provenance = merge_provenance(
+        base, {"s": []}, base, {"/s": "id"}, ["/s/0/v"],
+        resolutions={"/s/0/v": "left"},
+    )
+    assert merged == {"s": []}
+    assert provenance == [("/s/0", "left", True, True)]
+
+
+def test_provenance_redaction_does_not_change_records():
+    _, plain_conflicts, plain_provenance = Merger().merge_with_provenance(
+        {"a": 1}, {"a": 2}, {"a": 3}
+    )
+    _, redacted_conflicts, redacted_provenance = Merger(
+        None, None, ["/a"]
+    ).merge_with_provenance({"a": 1}, {"a": 2}, {"a": 3})
+    # Conflicts are masked...
+    assert redacted_conflicts[0].left == "[REDACTED]"
+    assert plain_conflicts[0].left == 2
+    # ... but provenance (which carries no values) is identical.
+    assert [
+        (p.path, p.source, p.adjudicated, p.deleted)
+        for p in redacted_provenance
+    ] == [
+        (p.path, p.source, p.adjudicated, p.deleted)
+        for p in plain_provenance
+    ]
+
+
+def test_provenance_is_deterministic():
+    base = {"srv": [{"id": "a", "v": 1}, {"id": "b", "v": 2}]}
+    left = {"srv": [{"id": "b", "v": 2}, {"id": "z"}, {"id": "a", "v": 11}]}
+    right = {"srv": [{"id": "a", "v": 1}, {"id": "b", "v": 22}, {"id": "a2"}]}
+    identity = {"/srv": "id"}
+    first = Merger(identity).merge_with_provenance(base, left, right)
+    for _ in range(5):
+        assert Merger(identity).merge_with_provenance(base, left, right) == first
+
+
+def test_provenance_records_agree_with_final_and_resolution_outcomes():
+    """Property: provenance stays consistent with the actual outcomes.
+
+    Across random three-way documents, each non-deleted provenance pointer
+    resolves in the final document (and each deleted pointer does not),
+    pointers are sorted and unique-up-to-tiebreak, and 'adjudicated' is
+    exactly whether the final value differs from the unresolved outcome.
+    """
+    import random
+
+    from app.merger import _pointer_exists, parse_pointer
+
+    rng = random.Random(20260923)
+    scalars = [None, True, False, 1, 2, "x", "y"]
+
+    def doc(depth=0):
+        kind = rng.choice(
+            ["scalar", "scalar", "obj"] + (["list"] if depth < 2 else [])
+        )
+        if kind == "scalar" or depth == 2:
+            return rng.choice(scalars)
+        if kind == "list":
+            return [
+                {"id": rng.choice(["p", "q", "r"]), "v": rng.choice(scalars)}
+                for _ in range(rng.randrange(3))
+            ]
+        return {
+            k: doc(depth + 1)
+            for k in rng.sample(["a", "b", "srv"], rng.randrange(4))
+        }
+
+    def variant(base):
+        """A random mutation (or copy) of *base*."""
+        roll = rng.random()
+        if roll < 0.25 or not isinstance(base, dict):
+            return rng.choice(scalars)
+        out = {}
+        for key, value in base.items():
+            if rng.random() < 0.7:
+                out[key] = value if rng.random() < 0.5 else variant(value)
+        for key in rng.sample(["a", "b", "srv"], rng.randrange(2)):
+            if key not in out:
+                out[key] = rng.choice(scalars)
+        return out
+
+    identity = {"/srv": "id", "/srv/*/sub": "id"}
+    protected_pool = ["/a", "/b", "/srv/*", "/srv/*/v", ""]
+    redact_pool = ["/a", "/b", "/srv", "/srv/*/v"]
+    for _ in range(400):
+        base = doc()
+        left = variant(base) if rng.random() < 0.8 else base
+        right = variant(base) if rng.random() < 0.8 else base
+        protected = [p for p in protected_pool if rng.random() < 0.25]
+        redact = [p for p in redact_pool if rng.random() < 0.2]
+        merger = Merger(identity, protected, redact)
+        kept, kept_conflicts, kept_provenance = merger.merge_with_provenance(
+            base, left, right
+        )
+        # Without resolutions every provenance record is unadjudicated.
+        assert all(not p.adjudicated for p in kept_provenance)
+        # Adjudicate a random subset of the reported conflicts.
+        reported = [c.path for c in kept_conflicts]
+        sides = ["base", "left", "right"]
+        resolutions = {
+            pointer: rng.choice(sides) for pointer in reported if rng.random() < 0.5
+        }
+        final, conflicts, provenance = merger.merge_with_provenance(
+            base, left, right, resolutions
+        )
+        # Resolutions never change the reported conflicts.
+        assert [(c.path, c.kind) for c in conflicts] == [
+            (c.path, c.kind) for c in kept_conflicts
+        ]
+
+        rendered = [p.path for p in provenance]
+        # Sorted by final pointer with the declared tie-break.
+        assert rendered == sorted(rendered)
+        for record in provenance:
+            tokens = parse_pointer(record.path)
+            exists_final = _pointer_exists(final, tokens)
+            exists_base = _pointer_exists(base, tokens)
+            if record.deleted:
+                # A deleted unit resolves in base (its record keeps the
+                # original location), never in the final document...
+                assert exists_base, (base, left, right, record)
+                assert not exists_final, (final, record)
+                # ... and a deletion is never sourced from 'base'.
+                assert record.source in ("left", "right", "merged")
+            else:
+                assert exists_final, (final, record)
+        # Any adjudicated record requires at least one explicit
+        # resolution (atomic-unit resolutions can adjudicate sibling
+        # leaves under a different pointer, so the check is intentionally
+        # at the document level).
+        if any(p.adjudicated for p in provenance):
+            assert resolutions

@@ -4,13 +4,16 @@ from __future__ import annotations
 
 from typing import Any, Literal, Optional
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, model_serializer
 
 # Any JSON document: object, array, string, number, boolean or null.
 JsonValue = Optional[Any]
 
 # Sides a conflict can be adjudicated to.
 ResolutionSide = Literal["base", "left", "right"]
+
+# Side a final value came from, per a provenance record.
+ProvenanceSource = Literal["base", "left", "right", "merged"]
 
 
 class ConflictResolution(BaseModel):
@@ -102,6 +105,28 @@ class MergeRequest(BaseModel):
             "HTTP 400."
         ),
     )
+    include_provenance: StrictBool = Field(
+        default=False,
+        alias="includeProvenance",
+        description=(
+            "When true, the response additionally carries a 'provenance' "
+            "array: one record per actual changed scalar leaf (or whole "
+            "atomic array value) and per added/removed/whole-item "
+            "adjudicated identity-array item, sorted by its final JSON "
+            "Pointer. Each record names the side the final value came "
+            "from ('base' when a conflict or protection kept the base "
+            "value, 'left'/'right' for a single winning side, 'merged' "
+            "for an identical two-sided change or a two-sided deletion), "
+            "whether the outcome was produced by a conflict resolution "
+            "('adjudicated'), and whether the unit is absent from the "
+            "final document ('deleted'; the pointer keeps the original "
+            "base location, and identity-array items use their original "
+            "base index). Provenance stays consistent with protectedPaths, "
+            "redactPaths and conflictResolutions and records no values, so "
+            "redaction never masks or removes records. When false (the "
+            "default) the response is exactly the unextended envelope."
+        ),
+    )
 
 
 class Conflict(BaseModel):
@@ -122,6 +147,63 @@ class Conflict(BaseModel):
     right: JsonValue
 
 
+class ProvenanceEntry(BaseModel):
+    """Origin of one changed scalar leaf or identity-array item."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    pointer: str = Field(
+        ...,
+        description=(
+            "JSON Pointer (RFC 6901) of the changed unit in the final "
+            "merged document. Identity-array items are addressed by their "
+            "final index; a deleted item keeps its original base index."
+        ),
+    )
+    source: ProvenanceSource = Field(
+        ...,
+        description=(
+            "Where the final value came from: 'left' or 'right' is the "
+            "single winning revision; 'merged' means both revisions "
+            "arrived at the value together (an identical two-sided "
+            "change, or a two-sided deletion); 'base' means a conflict or "
+            "a protectedPaths location kept the base value."
+        ),
+    )
+    adjudicated: bool = Field(
+        ...,
+        description=(
+            "True when the final outcome at this pointer was produced by "
+            "an explicit conflictResolutions entry (it differs from the "
+            "unresolved default outcome); false otherwise."
+        ),
+    )
+    deleted: bool = Field(
+        ...,
+        description=(
+            "True when the unit is absent from the final merged document. "
+            "Its pointer keeps the original base location (and an "
+            "identity-array item its original base index)."
+        ),
+    )
+
+
 class MergeResponse(BaseModel):
     merged: JsonValue
     conflicts: list[Conflict]
+    provenance: Optional[list[ProvenanceEntry]] = Field(
+        default=None,
+        description=(
+            "Present only when the request sets includeProvenance=true: "
+            "the origin of every actual changed leaf or identity-array "
+            "item, sorted by final JSON Pointer."
+        ),
+    )
+
+    @model_serializer(mode="wrap")
+    def _omit_provenance_unless_requested(self, handler):  # type: ignore[no-untyped-def]
+        """Keep the envelope byte-identical when provenance is off."""
+        result = handler(self)
+        if self.provenance is None:
+            result.pop("provenance", None)
+        return result
